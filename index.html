@@ -1432,18 +1432,29 @@ async function fetchKlines(interval, limit=100, assetOverride) {
         }
       } catch(_){}
     }
-    const cgMap = {'5m':1,'15m':1,'1h':1,'4h':7,'1d':30,'1w':90};
-    const days = cgMap[interval]||1;
+    // CoinGecko OHLC: returns only 2 candles for 1-day, 7 for 7-day, 30 for 30-day, 90 for 90-day, 365 for 365-day
+    // For short timeframes (5m/15m/1h), CoinGecko returns too few candles — use days=365 and take last N
+    // CoinGecko OHLC granularity: 1-2 days → 30min, 3-30 days → 4h, 31+ days → 4d
+    const cgMap = {'5m':365,'15m':365,'1h':365,'4h':90,'1d':90,'1w':365};
+    const days = cgMap[interval]||365;
     const coinId = CG_COIN_MAP[a.binanceSymbol] || 'bitcoin';
     try {
       const d = await tryFetch(`https://api.coingecko.com/api/v3/coins/${coinId}/ohlc?vs_currency=usd&days=${days}`);
       if(Array.isArray(d) && d.length>0) {
+        // CoinGecko returns candles in ascending time order — take the most recent ones
         const mapped = d.slice(-limit).map(k=>[k[0],k[1],k[2],k[3],k[4],0]);
-        if(!assetOverride) { const ck = `${a.symbol}:${interval}`; _klineCache[ck] = {data:mapped, source:'coingecko', timestamp:Date.now()}; }
-        return {data:mapped, source:'coingecko'};
+        // Verify we have enough candles for meaningful analysis (at least 20)
+        if(mapped.length >= 20) {
+          if(!assetOverride) { const ck = `${a.symbol}:${interval}`; _klineCache[ck] = {data:mapped, source:'coingecko', timestamp:Date.now()}; }
+          return {data:mapped, source:'coingecko'};
+        }
+        // Not enough CoinGecko candles — fall through to generate fallback data
+        console.warn(`[CoinGecko] Only ${mapped.length} candles for ${interval} — using fallback`);
       }
     } catch(_){}
-    throw new Error('All kline sources failed');
+    // Final fallback: generate synthetic klines from the last known price
+    const fallbackData = _generateFallbackKlines(currentPrice || 50000, interval);
+    return {data: fallbackData, source:'fallback'};
   } else {
     const result = await fetchTwelveKlines(a.twelveSymbol, interval, limit);
     // Cache the result for the current asset
@@ -2266,7 +2277,14 @@ function analyzeTF(rawData, price) {
     else if(pos>0.65){total+=2;bear+=1;}  // expanded bear zone
     // 0.35-0.65 = true neutral, no weight added
   }
-  if(stK!=null) add(stK<50);
+  // Stochastic: mean-reversion logic (like RSI) — oversold=bullish, overbought=bearish
+  if(stK!=null){
+    if(stK<20){total+=2;bull+=2;}       // oversold = bullish reversal
+    else if(stK<30){total+=2;bull+=1;}   // approaching oversold
+    else if(stK>80){total+=2;bear+=2;}   // overbought = bearish reversal
+    else if(stK>70){total+=2;bear+=1;}   // approaching overbought
+    // 30-70 = neutral zone, no weight added
+  }
   if(stK!=null && stD!=null){ add(stK>stD, 1); }
   if(vw && vw>0) add(price>vw);
   if(mc) add(mc.positive);
@@ -4121,11 +4139,11 @@ let btResults = null; // cached backtest results for Master Score integration
 
 // ── Walk-Forward Backtesting Engine ─────────────────────────────
 // Simulates trading using the current indicator logic on historical data.
-// Strategy: Enter on bull/bear signal (>=65%), exit at TP1 (1.5×ATR) or SL (1.0×ATR)
+// Strategy: Enter on bull/bear signal (>=60%), exit at TP1 (1.5×ATR) or SL (1.0×ATR)
 async function runBacktest(tfLabel, signalThreshold) {
   if(btRunning) return null;
   btRunning = true;
-  signalThreshold = signalThreshold || 65;
+  signalThreshold = signalThreshold || 60; // Match analyzeTF threshold (60%)
 
   // For forex/gold, use a lower effective threshold since volume-dependent
   // indicators (MFI, CMF, OBV, VWAP) are unavailable, reducing signal strength
@@ -6197,6 +6215,8 @@ async function runAnalysis() {
     const priceSanity = () => {
       if(currentAsset.type === 'crypto' && currentAsset.symbol === 'BTC/USDT' && currentPrice < 5000) return false;
       if(currentAsset.type === 'crypto' && currentAsset.symbol === 'ETH/USDT' && currentPrice < 500) return false;
+      if(currentAsset.type === 'crypto' && currentAsset.symbol === 'BNB/USDT' && currentPrice < 100) return false;
+      if(currentAsset.type === 'crypto' && currentAsset.symbol === 'SOL/USDT' && currentPrice < 10) return false;
       if(currentAsset.type === 'gold' && currentPrice < 500) return false;
       if(currentAsset.type === 'forex' && currentPrice > 300) return false;
       if(currentPrice <= 0) return false;
