@@ -6450,13 +6450,17 @@ async function runAnalysis() {
     clearTimeout(refreshTimer);
     refreshTimer=setTimeout(runAnalysis, REFRESH_SEC*1000);
 
-    // ── Async: Order book (non-blocking, render when ready) ────────
+    // ── Async: Order book (await so obScore is correct in master score) ──
     let obResult = {data:null, source:'none'};
-    fetchOrderBook().then(result => {
-      if(silentAbort()) return;
-      obResult = result;
-      renderDepth(obResult, ticker);
-    }).catch(()=> renderDepth({data:null,source:'none'}, ticker));
+    try {
+      const obFetchResult = await fetchOrderBook();
+      if(!silentAbort()) {
+        obResult = obFetchResult;
+        renderDepth(obResult, ticker);
+      }
+    } catch(_) {
+      renderDepth({data:null,source:'none'}, ticker);
+    }
 
     // ── Fetch real sentiment data + news in parallel (non-blocking) ──
     const localSentiment = generateLocalSentiment(results, ticker);
