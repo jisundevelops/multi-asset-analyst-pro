@@ -4393,7 +4393,10 @@ async function runBacktest(tfLabel, signalThreshold) {
     }
 
     // Calculate metrics
-    const metrics = calcBacktestMetrics(trades, equity);
+    // Estimate trading days from candle count and timeframe
+    const tfTradingDays = { '5m': raw.length / 288, '15m': raw.length / 96, '1H': raw.length / 24, '4H': raw.length / 6, '1D': raw.length, '1W': raw.length * 5 };
+    const tradingDays = Math.max(1, Math.round(tfTradingDays[tfLabel] || raw.length));
+    const metrics = calcBacktestMetrics(trades, equity, tradingDays);
     btResults = { trades, equity, metrics, tf: tfLabel, signalThreshold, effectiveThreshold, asset: currentAsset.symbol, candlesUsed: raw.length };
     console.log(`[Backtest] ${currentAsset.symbol} ${tfLabel}: ${trades.length} trades, ${raw.length} candles, threshold=${effectiveThreshold}%`);
     return btResults;
@@ -4407,7 +4410,7 @@ async function runBacktest(tfLabel, signalThreshold) {
 }
 
 // ── Calculate Comprehensive Validation Metrics ──────────────────
-function calcBacktestMetrics(trades, equity) {
+function calcBacktestMetrics(trades, equity, tradingDays) {
   const n = trades.length;
   if(n === 0) {
     return {
@@ -4422,7 +4425,8 @@ function calcBacktestMetrics(trades, equity) {
   }
 
   const wins = trades.filter(t => t.pnl > 0);
-  const losses = trades.filter(t => t.pnl <= 0);
+  const losses = trades.filter(t => t.pnl < 0);
+  const breakeven = trades.filter(t => t.pnl === 0).length;
   const winRate = (wins.length / n) * 100;
 
   const totalWin = wins.reduce((a, t) => a + t.pnl, 0);
@@ -4467,7 +4471,8 @@ function calcBacktestMetrics(trades, equity) {
   }
 
   // Calmar Ratio (annualized return / max drawdown)
-  const annualReturn = totalPnLPct * (252 / Math.max(1, trades.length));
+  const days = tradingDays || Math.max(1, n); // fallback to trade count if not provided
+  const annualReturn = totalPnLPct * (252 / days);
   const calmarRatio = maxDDPct > 0 ? annualReturn / maxDDPct : 0;
 
   // Average holding period (in bars)
@@ -4515,6 +4520,7 @@ function calcBacktestMetrics(trades, equity) {
     winRate: +winRate.toFixed(1),
     wins: wins.length,
     losses: losses.length,
+    breakeven,
     avgWin: +avgWin.toFixed(2),
     avgLoss: +avgLoss.toFixed(2),
     profitFactor: +profitFactor.toFixed(2),
@@ -4560,6 +4566,9 @@ function renderBacktestPanel(btData) {
     if(!btData) {
       html += '<div class="bt-empty">🧪 Backtest চালানো হয়নি।<br>Timeframe ও Signal Threshold সিলেক্ট করে "Run Backtest" ক্লিক করো।<br><br><span style="font-size:10px;color:var(--dim)">এটি historical data তে আপনার indicator strategy টেস্ট করে দেখাবে — trades, win rate, PnL, drawdown সব।</span></div>';
       setHTML('backtestContent', html);
+      // Attach event listener even when no backtest data (button must work!)
+      const btBtn = $id('btRunBtn');
+      if(btBtn) btBtn.addEventListener('click', btRunFromUI);
       return;
     }
 
@@ -4582,7 +4591,7 @@ function renderBacktestPanel(btData) {
     html += `<div class="bt-metric-box info">
       <div class="bt-metric-label">Total Trades</div>
       <div class="bt-metric-val" style="color:var(--cyan)">${m.totalTrades}</div>
-      <div class="bt-metric-sub">${m.wins}W / ${m.losses}L</div>
+      <div class="bt-metric-sub">${m.wins}W / ${m.losses}L${m.breakeven > 0 ? ' / '+m.breakeven+'BE' : ''}</div>
     </div>`;
 
     // Win Rate
