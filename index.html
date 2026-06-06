@@ -1454,7 +1454,7 @@ async function fetchKlines(interval, limit=100, assetOverride) {
       }
     } catch(_){}
     // Final fallback: generate synthetic klines from the last known price
-    const fallbackPrice = (assetOverride ? _tickerCache[assetOverride.symbol]?.lastPrice : currentPrice) || currentPrice || 50000;
+    const fallbackPrice = (assetOverride ? _tickerCache[assetOverride.symbol]?.data?.lastPrice : currentPrice) || currentPrice || 50000;
     const fallbackData = _generateFallbackKlines(+fallbackPrice || 50000, interval);
     return {data: fallbackData, source:'fallback'};
   } else {
@@ -1850,15 +1850,30 @@ function detectSqueeze(closes, candles) {
     const bbWidth=bband.upper-bband.lower;
     const keltnerWidth=keltnerUpper-keltnerLower;
     const squeezing=bbWidth<keltnerWidth;
+    // Detect firing: previous candle was squeezing, current is not
+    let firing = false;
+    if(!squeezing && closes.length > 21 && candles.length > 21) {
+      const prevCloses = closes.slice(0, -1);
+      const prevCandles = candles.slice(0, -1);
+      const prevBB = bb(prevCloses, 20, 2);
+      const prevE20 = ema(prevCloses, 20);
+      const prevATR = atr(prevCandles, 20);
+      if(prevBB && prevE20 && prevATR) {
+        const prevBBW = prevBB.upper - prevBB.lower;
+        const prevKW = (prevE20 + prevATR*1.5) - (prevE20 - prevATR*1.5);
+        firing = prevBBW < prevKW; // was squeezing, now released
+      }
+    }
     // Momentum direction (for firing direction)
     const mc=macd(closes);
     const momentum=mc?(mc.hist>0?'bullish':'bearish'):'neutral';
     return {
       squeezing,
+      firing,
       bbWidth:bbWidth.toFixed(2),
       keltnerWidth:keltnerWidth.toFixed(2),
       momentum,
-      description:squeezing?`Squeeze Active — ${momentum} momentum`:'No squeeze'
+      description:squeezing?`Squeeze Active — ${momentum} momentum`:firing?`Squeeze Firing — ${momentum} momentum`:'No squeeze'
     };
   } catch(_){ return {squeezing:false, firing:false, description:'N/A'}; }
 }
@@ -3352,7 +3367,7 @@ function renderTPSL(bestTF, results, price) {
       <div class="tpsl-box entry"><div class="tpsl-label">Entry Zone</div><div class="tpsl-price entry">${fmtPrice(price)}</div><div class="tpsl-pct">Current Price</div></div>
       <div class="tpsl-box tp1"><div class="tpsl-label">Take Profit 1</div><div class="tpsl-price tp">${fmtPrice(r.tp1)}</div><div class="tpsl-pct" style="color:var(--green)">${p1>0?'+':''}${p1}%</div></div>
       <div class="tpsl-box tp2"><div class="tpsl-label">Take Profit 2</div><div class="tpsl-price tp">${fmtPrice(r.tp2)}</div><div class="tpsl-pct" style="color:var(--green)">${p2>0?'+':''}${p2}%</div></div>
-      <div class="tpsl-box sl"><div class="tpsl-label">Stop Loss</div><div class="tpsl-price sl">${fmtPrice(r.sl)}</div><div class="tpsl-pct" style="color:var(--red)">${ps}%</div></div>
+      <div class="tpsl-box sl"><div class="tpsl-label">Stop Loss</div><div class="tpsl-price sl">${fmtPrice(r.sl)}</div><div class="tpsl-pct" style="color:var(--red)">-${Math.abs(ps)}%</div></div>
     </div>
     <div class="prob-display">
       <div class="prob-item"><div class="prob-item-val" style="color:var(--green)">${r.bullPct}%</div><div class="prob-item-label">📈 Bullish</div></div>
@@ -3739,19 +3754,27 @@ async function fetchMacroData() {
 
 // ── Cross-Asset Correlation Engine ────────────────────────────
 function calcPearsonCorrelation(arr1, arr2) {
-  // Calculate Pearson correlation coefficient between two arrays
+  // Calculate Pearson correlation on percentage returns (not raw prices)
+  // Raw price correlation is spurious — trending assets always show high correlation
   if(!arr1 || !arr2 || arr1.length < 5 || arr2.length < 5) return null;
   const n = Math.min(arr1.length, arr2.length);
   const x = arr1.slice(-n);
   const y = arr2.slice(-n);
-
-  const meanX = x.reduce((a,b) => a+b, 0) / n;
-  const meanY = y.reduce((a,b) => a+b, 0) / n;
+  // Convert to returns (percentage changes)
+  const rx = [], ry = [];
+  for(let i = 1; i < n; i++) {
+    rx.push(x[i-1] !== 0 ? (x[i] - x[i-1]) / x[i-1] : 0);
+    ry.push(y[i-1] !== 0 ? (y[i] - y[i-1]) / y[i-1] : 0);
+  }
+  const rn = rx.length;
+  if(rn < 4) return null;
+  const meanX = rx.reduce((a,b) => a+b, 0) / rn;
+  const meanY = ry.reduce((a,b) => a+b, 0) / rn;
 
   let sumXY = 0, sumX2 = 0, sumY2 = 0;
-  for(let i = 0; i < n; i++) {
-    const dx = x[i] - meanX;
-    const dy = y[i] - meanY;
+  for(let i = 0; i < rn; i++) {
+    const dx = rx[i] - meanX;
+    const dy = ry[i] - meanY;
     sumXY += dx * dy;
     sumX2 += dx * dx;
     sumY2 += dy * dy;
@@ -3765,13 +3788,13 @@ function calcPearsonCorrelation(arr1, arr2) {
 // Fetch cross-asset daily closes for correlation calculation
 // Uses cache to avoid repeated API calls every refresh cycle
 let _crossAssetClosesCache = null;
-let _crossAssetCachesCacheTime = 0;
+let _crossAssetClosesCacheTime = 0;
 const CROSS_ASSET_CACHE_TTL = 300000; // 5 minutes
 
 async function fetchCrossAssetCloses() {
   const now = Date.now();
   // Return cached data if fresh enough
-  if(_crossAssetClosesCache && (now - _crossAssetCachesCacheTime) < CROSS_ASSET_CACHE_TTL) {
+  if(_crossAssetClosesCache && (now - _crossAssetClosesCacheTime) < CROSS_ASSET_CACHE_TTL) {
     return _crossAssetClosesCache;
   }
 
@@ -3809,7 +3832,7 @@ async function fetchCrossAssetCloses() {
   await Promise.allSettled(fetchPromises);
   // Cache the result
   _crossAssetClosesCache = assetCloses;
-  _crossAssetCachesCacheTime = now;
+  _crossAssetClosesCacheTime = now;
   return assetCloses;
 }
 
@@ -4529,7 +4552,7 @@ function renderBacktestPanel(btData) {
         <option value="75">75% Signal Threshold</option>
         <option value="80">80% Signal Threshold</option>
       </select>
-      <button class="bt-run-btn" id="btRunBtn" onclick="btRunFromUI()">
+      <button class="bt-run-btn" id="btRunBtn" data-action="bt-run">
         <span id="btRunIcon">▶</span> Run Backtest
       </button>
     </div>`;
@@ -4621,6 +4644,10 @@ function renderBacktestPanel(btData) {
     }
 
     setHTML('backtestContent', html);
+
+    // Attach event listener for backtest run button (no inline onclick)
+    const btBtn = $id('btRunBtn');
+    if(btBtn) btBtn.addEventListener('click', btRunFromUI);
 
     // Draw equity curve after DOM update
     setTimeout(() => drawEquityCurve(btData.equity), 50);
@@ -5189,25 +5216,29 @@ function calcPredictiveRange(currentPrice, atr, volatility, signal, confidence) 
     // Confidence factor (0.5 to 1.5)
     const confFactor = 0.5 + (conf / 100);
 
+    // Volatility factor: widen range when 24H change % is high
+    const vol = (typeof volatility === 'number' && isFinite(volatility)) ? Math.abs(volatility) : 0;
+    const volFactor = 1 + Math.min(vol / 10, 1); // boost up to 2x for high volatility
+
     // Time-based ATR scaling
     const scale1h = 0.25;
     const scale4h = 0.5;
     const scale24h = 1.0;
 
-    // Range calculations
+    // Range calculations (volatility widens the range)
     const range1h = {
-      low: price - a * scale1h * confFactor * (1 + Math.max(0, -dir * 0.3)),
-      high: price + a * scale1h * confFactor * (1 + Math.max(0, dir * 0.3)),
+      low: price - a * scale1h * confFactor * volFactor * (1 + Math.max(0, -dir * 0.3)),
+      high: price + a * scale1h * confFactor * volFactor * (1 + Math.max(0, dir * 0.3)),
       center: price + a * scale1h * dir * 0.3
     };
     const range4h = {
-      low: price - a * scale4h * confFactor * (1 + Math.max(0, -dir * 0.4)),
-      high: price + a * scale4h * confFactor * (1 + Math.max(0, dir * 0.4)),
+      low: price - a * scale4h * confFactor * volFactor * (1 + Math.max(0, -dir * 0.4)),
+      high: price + a * scale4h * confFactor * volFactor * (1 + Math.max(0, dir * 0.4)),
       center: price + a * scale4h * dir * 0.4
     };
     const range24h = {
-      low: price - a * scale24h * confFactor * (1 + Math.max(0, -dir * 0.5)),
-      high: price + a * scale24h * confFactor * (1 + Math.max(0, dir * 0.5)),
+      low: price - a * scale24h * confFactor * volFactor * (1 + Math.max(0, -dir * 0.5)),
+      high: price + a * scale24h * confFactor * volFactor * (1 + Math.max(0, dir * 0.5)),
       center: price + a * scale24h * dir * 0.5
     };
 
@@ -5259,7 +5290,7 @@ function calcSignalReliability(signal, regime, btResults) {
   }
 }
 
-function detectMarketPhase(candles, volumeData) {
+function detectMarketPhase(candles) {
   try {
     if(!candles || candles.length < 30) {
       return { phase: 'unknown', confidence: 0, description: 'পর্যাপ্ত data নেই market phase detect করতে' };
@@ -5284,10 +5315,10 @@ function detectMarketPhase(candles, volumeData) {
     const volOlder = volumes.slice(-30, -10).reduce((a,b)=>a+b,0) / 20;
     const volTrend = volOlder > 0 ? volRecent / volOlder : 1;
 
-    // Volatility
+    // Volatility (used for phase detection — high volatility = trending, low = ranging)
     const returns = [];
     for(let i = 1; i < n; i++) returns.push((closes[i] - closes[i-1]) / closes[i-1]);
-    const vol = Math.sqrt(returns.reduce((a,b)=>a+b*b,0) / returns.length) * Math.sqrt(365);
+    const vol = returns.length > 0 ? Math.sqrt(returns.reduce((a,b)=>a+b*b,0) / returns.length) : 0;
 
     // RSI for momentum — use RMA for consistency with main RSI function
     const changes = [];
@@ -5336,9 +5367,16 @@ function detectMarketPhase(candles, volumeData) {
       confidence = 50;
       description = 'Downtrend থেকে recovery হচ্ছে — নতুন markup phase শুরু হতে পারে।';
     } else {
-      phase = 'accumulation';
-      confidence = 40;
-      description = 'মার্কেট transitional state এ আছে — clear phase detect হচ্ছে না।';
+      // Use volatility to distinguish trending vs ranging
+      if(vol > 0.03) {
+        phase = priceChange > 0 ? 'markup' : 'markdown';
+        confidence = 40;
+        description = 'মার্কেট high volatility তে আছে — trending move সম্ভবত।';
+      } else {
+        phase = 'accumulation';
+        confidence = 40;
+        description = 'মার্কেট transitional state এ আছে — clear phase detect হচ্ছে না।';
+      }
     }
 
     return { phase, confidence: Math.round(confidence), description };
@@ -6191,6 +6229,8 @@ async function runAnalysis() {
   // If the entire analysis takes more than 30s (e.g., all API keys exhausted),
   // force-show the dashboard with fallback data so the user isn't stuck on loading
   const _analysisTimeout = setTimeout(() => {
+    // Don't touch DOM if this analysis was superseded by a newer one
+    if(aborted()) return;
     console.warn('[Timeout] Analysis taking too long, forcing dashboard display with fallback data');
     if(overlay) overlay.classList.add('hidden');
     if(main) main.style.display='block';
@@ -6768,7 +6808,11 @@ async function runAnalysis() {
     // Fetch cross-asset correlation data (non-blocking)
     // Skip if fewer than 3 usable keys (save API budget for essential data)
     try {
-      const currentDailyCloses = bestCandles.slice(-30).map(c => c.c);
+      // Use 1D kline data for correlation (matches cross-asset 1D data)
+      const tfIdx1D = TIMEFRAMES.findIndex(t => t.label === '1D');
+      const currentDailyCloses = (tfIdx1D >= 0 && klineResults[tfIdx1D]?.data)
+        ? klineResults[tfIdx1D].data.slice(-30).map(k => +k[4])
+        : bestCandles.slice(-30).map(c => c.c);
       const usableKeys = _tdUsableKeyCount();
       if(currentDailyCloses.length >= 10 && (currentAsset.type === 'crypto' || usableKeys >= 3)) {
         const assetCloses = await fetchCrossAssetCloses();
