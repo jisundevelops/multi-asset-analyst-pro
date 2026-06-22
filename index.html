@@ -1172,16 +1172,8 @@ const ASSETS = {
 // Each key is tracked independently; auto-ban on 429, auto-unban after 65s cooldown
 // DAILY BAN: Keys that exhaust daily credits are banned until next UTC midnight
 const TD_API_KEYS = [
-  '6a0a4134db994f3cbf10d8c1cf906a38',
-  'eddc87942b974df3b3ea0d0c4f358e40',
-  'e829aa56ee564ad4b55745e3fa6a0e59',
-  '24685301e2f64130b89fe7ee7dc858e0',
-  'c5ab30582ff14822b9b0fe99e723948e',
-  '98136dbd9ba6443eb5ac641546cd7281',
-  '3bba1b08b2db40a386ba6cb2d04ca2fb',
-  'dd0ba8f77b0c430fb535fab7c41839f3',
-  '44e500d879f941ebad6429018d630220',
-  '70153912679b4f599aec0b9d3f1ec356',
+  // Keys moved to Vercel environment variables (TD_KEY_1 … TD_KEY_10)
+  // Proxied via /api/td — not needed in frontend
 ];
 
 // Track per-key rate limits and ban status
