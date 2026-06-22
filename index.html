@@ -7892,19 +7892,9 @@ function autoLogTrade(results, bestTF, price, masterScoreVal, asset) {
     const r = results[bestTF];
     if(!r || !r.tp1 || !r.sl || !r.tp2) return;
     if(r.signal === 'neutral') return;
-    if(r.prob < 70) return; // Confidence threshold: 70%
+    if(r.prob < 65) return; // Confidence threshold: 65%
 
     const trades = _tjLoad();
-
-    // Duplicate guard: skip if same asset+TF pending trade within last 4 hours
-    const fourHrsAgo = Date.now() - 4 * 60 * 60 * 1000;
-    const dup = trades.some(t =>
-      t.asset === asset.displayName &&
-      t.timeframe === bestTF &&
-      t.status === 'pending' &&
-      new Date(t.timestamp).getTime() > fourHrsAgo
-    );
-    if(dup) return;
 
     const now = new Date();
     const dayNames = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
