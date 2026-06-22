@@ -1417,8 +1417,8 @@ async function fetchTwelveKlines(twelveSymbol, interval, limit=100) {
   // Twelve Data supports up to 5000 outputsize; we need at least 100 for backtesting
   // Ichimoku needs 52 candles, backtest needs 100 candles with 30-bar warmup
   const effectiveLimit = Math.min(limit, 500);
-  const apiKey = getTDKey();
-  const url = `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(twelveSymbol)}&interval=${tdInterval}&outputsize=${effectiveLimit}&apikey=${apiKey}`;
+  getTDKey(); // keep call-tracking active
+  const url = `/api/td?_ep=time_series&symbol=${encodeURIComponent(twelveSymbol)}&interval=${tdInterval}&outputsize=${effectiveLimit}`;
   const d = await tryFetch(url, 8000, 1); // 8s timeout, 1 retry — faster failure for slow API
   if(d?.status === 'error') {
     // Check for daily credit exhaustion first (more severe than rate limit)
@@ -1446,9 +1446,9 @@ async function fetchTwelveTicker(twelveSymbol) {
   // Use ONLY the quote endpoint — it has price, change, volume, high, low all in one call
   // (Previously used 2 calls: price + quote — now optimized to 1 call)
   await _tdWaitForRateLimit();
-  const apiKey = getTDKey();
+  const apiKey = getTDKey(); // keep tracking active
   const quoteData = await tryFetch(
-    `https://api.twelvedata.com/quote?symbol=${encodeURIComponent(twelveSymbol)}&apikey=${apiKey}`, 8000, 1
+    `/api/td?_ep=quote&symbol=${encodeURIComponent(twelveSymbol)}`, 8000, 1
   ).catch(()=>null);
 
   // Check for daily limit or rate limit
@@ -1460,9 +1460,9 @@ async function fetchTwelveTicker(twelveSymbol) {
     }
     // Fallback: try price-only endpoint (cheaper, 1 more call but always works)
     await _tdWaitForRateLimit();
-    const apiKey2 = getTDKey();
+    const apiKey2 = getTDKey(); // keep tracking active
     const priceData = await tryFetch(
-      `https://api.twelvedata.com/price?symbol=${encodeURIComponent(twelveSymbol)}&apikey=${apiKey2}`, 6000, 0
+      `/api/td?_ep=price&symbol=${encodeURIComponent(twelveSymbol)}`, 6000, 0
     ).catch(()=>null);
     if(priceData?.status === 'error') {
       if(_isDailyLimitError(priceData.message)) dailyBanTDKey(apiKey2);
@@ -3727,9 +3727,9 @@ async function fetchFinnhubQuote(symbol) {
 async function fetchTwelveQuote(symbol) {
   try {
     await _tdWaitForRateLimit();
-    const apiKey = getTDKey();
+    const apiKey = getTDKey(); // keep tracking active
     const d = await tryFetch(
-      `https://api.twelvedata.com/quote?symbol=${encodeURIComponent(symbol)}&apikey=${apiKey}`,
+      `/api/td?_ep=quote&symbol=${encodeURIComponent(symbol)}`,
       8000, 1
     );
     if(d?.status === 'error') {
@@ -6402,8 +6402,8 @@ async function runAnalysis() {
         const usableKeys = _tdUsableKeyCount();
         if(usableKeys > 0) {
           await _tdWaitForRateLimit();
-          const apiKey = getTDKey();
-          const p = await tryFetch(`https://api.twelvedata.com/price?symbol=${encodeURIComponent(currentAsset.twelveSymbol)}&apikey=${apiKey}`, 6000, 0);
+          const apiKey = getTDKey(); // keep tracking active
+          const p = await tryFetch(`/api/td?_ep=price&symbol=${encodeURIComponent(currentAsset.twelveSymbol)}`, 6000, 0);
           if(p?.price && !aborted()) {
             currentPrice = +p.price;
             quickPrice = {data:{lastPrice:String(currentPrice), priceChangePercent:'0', volume:'0', highPrice:String(currentPrice), lowPrice:String(currentPrice)}, source:'twelvedata-price'};
@@ -8267,9 +8267,9 @@ async function _tjFetchHistoricalCandles(trade, startMs, endMs, ageMs) {
   } else {
     // Forex / Gold — Twelve Data
     try {
-      const key = getTDKey ? getTDKey() : TD_KEYS[0];
+      getTDKey && getTDKey(); // keep tracking active
       const fmt = ms => new Date(ms).toISOString().replace('T',' ').slice(0,19);
-      const url  = `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(trade.symbol)}&interval=${tdInterval}&start_date=${encodeURIComponent(fmt(startMs))}&outputsize=500&apikey=${key}`;
+      const url  = `/api/td?_ep=time_series&symbol=${encodeURIComponent(trade.symbol)}&interval=${tdInterval}&start_date=${encodeURIComponent(fmt(startMs))}&outputsize=500`;
       const data = await tryFetch(url, 10000, 1);
       if(data && data.values && data.values.length) {
         return data.values.slice().reverse().map(v => [
