@@ -2064,7 +2064,9 @@ function priceUpButOBVDown(candles, obvSeries){
   if(len<10) return false;
   const priceUp=candles[len-1].c>candles[len-10].c;
   const obvUp=obvSeries[len-1]>obvSeries[len-10];
-  return priceUp&&!obvUp; // bearish divergence
+  if(priceUp && !obvUp) return 'bearish'; // price up, OBV down = bearish divergence
+  if(!priceUp && obvUp) return 'bullish'; // price down, OBV up = bullish divergence
+  return false;
 }
 
 // ── PHASE 1 REMAINING: NEW INDICATOR FUNCTIONS ────────────────────
@@ -2082,7 +2084,8 @@ function calcCCI(candles, period=20) {
     meanDev /= period;
     if(meanDev === 0) return {value:0, signal:'neutral'};
     const cci = (tp[tp.length-1] - meanTP) / (0.015 * meanDev);
-    const signal = cci > 100 ? 'bear' : cci < -100 ? 'bull' : 'neutral';
+    // CCI > +100 = bullish momentum (price well above average), < -100 = bearish
+    const signal = cci > 100 ? 'bull' : cci < -100 ? 'bear' : 'neutral';
     return {value: +cci.toFixed(2), signal};
   } catch(_){ return null; }
 }
@@ -2104,7 +2107,8 @@ function calcMFI(candles, period=14) {
     if(totalVol === 0) return null; // No volume data — return null instead of misleading value
     if(negFlow === 0) return {value:100, signal:'bear'};
     const mfi = 100 - (100 / (1 + posFlow / negFlow));
-    const signal = mfi > 80 ? 'bear' : mfi < 20 ? 'bull' : 'neutral';
+    // MFI > 80 = strong buying (bullish), MFI < 20 = strong selling (bearish)
+    const signal = mfi > 80 ? 'bull' : mfi < 20 ? 'bear' : 'neutral';
     return {value: +mfi.toFixed(2), signal};
   } catch(_){ return null; }
 }
@@ -2497,10 +2501,11 @@ function analyzeTF(rawData, price) {
     else if(ichiData.signal==='bear'){ bear+=2; total+=2; }
     else { bull+=1; bear+=1; total+=2; }
   }
-  // OBV: trend confirmation
+  // OBV: trend confirmation + divergence
   if(obvData){
     add3(obvData.trend==='bullish'?'bull':obvData.trend==='bearish'?'bear':'neutral', 1);
-    if(obvData.divergence) { bear+=1; total+=1; } // bearish divergence
+    if(obvData.divergence==='bearish') { bear+=1; total+=1; }  // bearish divergence → bearish signal
+    if(obvData.divergence==='bullish') { bull+=1; total+=1; }  // bullish divergence → bullish signal
   }
   // Squeeze: potential breakout in momentum direction
   if(squeezeData && squeezeData.squeezing){
@@ -3584,7 +3589,7 @@ function renderAdvancedIndicators(adxData, ichiData, obvData, squeezeData, cciDa
     }
     // CCI
     if(cciData){
-      html += `<div class="ind-row"><span class="ind-name">CCI</span><div class="ind-right"><span class="ind-val">${cciData.value}</span><span class="ind-sig ${cciData.signal}">${cciData.value>100?'Overbought':cciData.value<-100?'Oversold':'Neutral'}</span></div></div>`;
+      html += `<div class="ind-row"><span class="ind-name">CCI</span><div class="ind-right"><span class="ind-val">${cciData.value}</span><span class="ind-sig ${cciData.signal}">${cciData.value>100?'Bullish':cciData.value<-100?'Bearish':'Neutral'}</span></div></div>`;
     }
     // MFI
     if(mfiData){
