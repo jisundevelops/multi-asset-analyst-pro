@@ -927,6 +927,42 @@
     .tj-trade-card{grid-template-columns:auto 1fr;gap:8px;}
     .tj-trade-card > div:last-child{grid-column:1/-1;}
   }
+
+/* ══════════════════════════════════════
+   5-GATE TRADE FILTER STYLES
+   ══════════════════════════════════════ */
+.gate-item {
+  background: var(--bg3,#0e1220);
+  border: 1px solid var(--border,#1a1f32);
+  border-radius: 10px;
+  padding: 12px 8px;
+  text-align: center;
+  transition: border-color .2s, background .2s;
+}
+.gate-item.gate-pass  { border-color: rgba(5,229,122,.4);  background: rgba(5,229,122,.05);  }
+.gate-item.gate-warn  { border-color: rgba(255,195,0,.35);  background: rgba(255,195,0,.05);  }
+.gate-item.gate-fail  { border-color: rgba(255,45,85,.3);   background: rgba(255,45,85,.04);  }
+.gate-item.gate-na    { border-color: rgba(255,255,255,.06); opacity:.6; }
+.gate-icon-large { font-size:22px; margin-bottom:4px; }
+.gate-name-txt  { font-size:9px; color:var(--dim,#6b7499); font-weight:700;
+                  text-transform:uppercase; letter-spacing:.6px; margin-bottom:4px; }
+.gate-status-txt { font-size:11px; font-weight:800; }
+.gate-status-txt.pass  { color:var(--green,#05e57a); }
+.gate-status-txt.warn  { color:var(--yellow,#ffc300); }
+.gate-status-txt.fail  { color:var(--red,#ff2d55); }
+.gate-status-txt.na    { color:var(--muted,#4a5278); }
+.gate-detail-txt { font-size:9px; color:var(--dim,#6b7499); margin-top:3px; line-height:1.3; }
+
+.gate-verdict-trade  { background:rgba(5,229,122,.1);  border:1px solid rgba(5,229,122,.3);  color:var(--green,#05e57a); }
+.gate-verdict-wait   { background:rgba(255,195,0,.08);  border:1px solid rgba(255,195,0,.25);  color:var(--yellow,#ffc300); }
+.gate-verdict-notrade{ background:rgba(255,45,85,.08);  border:1px solid rgba(255,45,85,.25);  color:var(--red,#ff2d55); }
+
+@media(max-width:700px){
+  #gateGrid { grid-template-columns: repeat(3,1fr) !important; }
+}
+@media(max-width:430px){
+  #gateGrid { grid-template-columns: repeat(2,1fr) !important; }
+}
 </style>
 </head>
 <body>
@@ -992,6 +1028,16 @@
 
   <!-- NEW: Multi-TF Confluence Banner -->
   <div id="confluenceBar"></div>
+
+  <!-- ── 5-GATE TRADE FILTER ─────────────────────────────────────── -->
+  <div class="card" id="gateFilterCard" style="display:none">
+    <div class="card-title" style="display:flex;align-items:center;justify-content:space-between">
+      <span>🔒 5-Gate Trade Filter</span>
+      <span id="gateAssetBadge" style="font-size:10px;padding:3px 8px;border-radius:5px;font-weight:700;letter-spacing:.5px"></span>
+    </div>
+    <div id="gateGrid" style="display:grid;grid-template-columns:repeat(5,1fr);gap:8px;margin-bottom:12px"></div>
+    <div id="gateVerdict" style="padding:12px 16px;border-radius:10px;font-size:13px;font-weight:700;display:flex;align-items:center;gap:8px"></div>
+  </div>
 
   <!-- NEW: Master Confidence Score Card -->
   <div class="card master-score-card" id="masterScoreCard"></div>
@@ -8293,6 +8339,344 @@ $id('tjOverlay')?.addEventListener('click', e => {
 // ── Init badge + historical check on page load ────────────────
 _tjUpdateBadge();
 setTimeout(() => { _tjCheckHistorical().catch(()=>{}); }, 5000);
+
+/* ══════════════════════════════════════════════════════════════
+   5-GATE TRADE FILTER  —  BTC & GOLD
+   ══════════════════════════════════════════════════════════════
+
+   GATE 1 : HTF Alignment      — Daily & Weekly must agree
+   GATE 2 : RSI Zone           — Not extreme against signal
+   GATE 3 : MACD Direction     — MACD same direction as signal
+   GATE 4 : Volume Confirm     — Spike required for breakout (ranging mkt)
+   GATE 5 : Risk:Reward ≥ 1:1.5— Hard minimum before any trade
+
+   Works for:  BTC/USDT (crypto)  +  XAU/USD (gold)
+   Neutral signals always → NO TRADE (gate 0 auto-fail)
+   ══════════════════════════════════════════════════════════════ */
+
+// ── Helpers ──────────────────────────────────────────────────
+function _gateHTFBias(results) {
+  /* Returns { direction, agree, dailySig, weeklySig, h4Sig, strength } */
+  const daily  = results['1D'];
+  const weekly = results['1W'];
+  const h4     = results['4H'];
+
+  if (!daily || !weekly) {
+    return { direction:'neutral', agree:false, dailySig:'neutral',
+             weeklySig:'neutral', h4Sig:'neutral', strength:'none' };
+  }
+
+  const dSig = daily.signal  || 'neutral';
+  const wSig = weekly.signal || 'neutral';
+  const agree = (dSig === wSig) && dSig !== 'neutral';
+
+  let direction = 'neutral', strength = 'none';
+  if (agree) {
+    direction = dSig;
+    strength  = (h4 && h4.signal === dSig) ? 'strong' : 'moderate';
+  } else if (dSig !== 'neutral') {
+    direction = dSig; strength = 'weak';
+  } else if (wSig !== 'neutral') {
+    direction = wSig; strength = 'weak';
+  }
+
+  return { direction, agree, dailySig:dSig, weeklySig:wSig,
+           h4Sig: h4?.signal || 'neutral', strength };
+}
+
+function _gateVolSpike(candles) {
+  /* Returns { spike:bool, ratio:number } from last 20 candles */
+  if (!candles || candles.length < 20) return { spike:false, ratio:1 };
+  // candles are raw kline arrays: [time,open,high,low,close,volume,...]
+  const parseVol = c => {
+    if (Array.isArray(c)) return +c[5] || 0;
+    return +(c.volume || c.v || 0);
+  };
+  const vols  = candles.slice(-20).map(parseVol);
+  const avg   = vols.slice(0, -1).reduce((a,b) => a+b, 0) / 19;
+  const cur   = vols[vols.length - 1];
+  return { spike: avg > 0 && cur > avg * 1.5, ratio: avg > 0 ? cur / avg : 1 };
+}
+
+function _gateADXTrending(tfResult) {
+  /* Returns true when ADX > 25 (trend strong enough to skip volume requirement) */
+  if (!tfResult) return false;
+  // analyzeTF stores adxData inside result — check common keys
+  const adx = tfResult.adxData || tfResult.adx;
+  if (!adx) return false;
+  return (adx.adx || adx.value || 0) > 25;
+}
+
+// ── Main Gate Calculator ──────────────────────────────────────
+/**
+ * @param {object}  results       — keyed by TF label (e.g. '1H','4H','1D','1W')
+ * @param {string}  signal        — 'bull' | 'bear' | 'neutral'
+ * @param {number}  price         — current price
+ * @param {object}  rawKlines     — { '1H': klineArray, '4H': klineArray, ... }
+ * @param {string}  assetType     — 'crypto' | 'gold' | 'forex'
+ */
+function calcGateFilter(results, signal, price, rawKlines, assetType) {
+  /* ── Gate 0: Must have a directional signal ─────────────── */
+  if (!signal || signal === 'neutral' || !price) {
+    return _buildGateResult(
+      [
+        _g('📅','HTF Bias',   'na','N/A','—'),
+        _g('📊','RSI Zone',   'na','N/A','—'),
+        _g('⚡','MACD Dir',   'na','N/A','—'),
+        _g('📦','Volume',     'na','N/A','—'),
+        _g('⚖️','R:R ≥ 1:1.5','na','N/A','—'),
+      ],
+      0, 0, null, signal, price, assetType
+    );
+  }
+
+  const h1  = results['1H']  || results['15m'] || null;
+  const h4  = results['4H']  || null;
+
+  // ── GATE 1: HTF Alignment ────────────────────────────────
+  const htf = _gateHTFBias(results);
+  const g1Pass = htf.agree && htf.direction === signal;
+  const g1Warn = !htf.agree && htf.direction === signal; // daily aligns, weekly doesn't
+  const g1Detail = htf.agree
+    ? `Daily+Weekly: ${htf.direction.toUpperCase()} ✓`
+    : `Daily: ${htf.dailySig} / Weekly: ${htf.weeklySig}`;
+
+  // ── GATE 2: RSI Zone ─────────────────────────────────────
+  const rsiVal = h1?.rsi ?? null;
+  let g2Pass = true, g2Warn = false;
+  let g2Detail = rsiVal !== null ? `RSI: ${Number(rsiVal).toFixed(1)}` : 'N/A';
+  if (rsiVal !== null) {
+    const ri = +rsiVal;
+    if (signal === 'bull') {
+      if (ri > 73)      { g2Pass = false; g2Detail += ' (Overbought — avoid long)'; }
+      else if (ri > 65) { g2Warn = true;  g2Detail += ' (Caution — getting hot)'; }
+    } else {
+      if (ri < 27)      { g2Pass = false; g2Detail += ' (Oversold — avoid short)'; }
+      else if (ri < 35) { g2Warn = true;  g2Detail += ' (Caution — getting cold)'; }
+    }
+  }
+
+  // ── GATE 3: MACD Direction ───────────────────────────────
+  const macdObj = h1?.macd || h1?.macdData || null;
+  let g3Pass = false, g3Warn = false, g3Detail = 'N/A';
+  if (macdObj) {
+    const positive   = macdObj.positive   ?? (macdObj.val  > (macdObj.signal || 0));
+    const histRising = macdObj.histRising  ?? false;
+    if (signal === 'bull') {
+      g3Pass = positive;
+      g3Warn = !positive && histRising; // recovering — histogram turning up
+      g3Detail = positive
+        ? `Above signal line ${histRising ? '(hist rising ✓)' : ''}`
+        : histRising ? 'Below signal but histogram recovering' : 'Below signal line';
+    } else {
+      g3Pass = !positive;
+      g3Warn = positive && !histRising;
+      g3Detail = !positive
+        ? `Below signal line ${!histRising ? '(hist falling ✓)' : ''}`
+        : !histRising ? 'Above signal but histogram weakening' : 'Above signal line';
+    }
+  }
+
+  // ── GATE 4: Volume Confirmation ──────────────────────────
+  // In a ranging market (ADX < 25) breakouts need volume confirmation.
+  // In trending markets volume spike is a bonus but not required.
+  const klines1H = rawKlines?.['1H'] || rawKlines?.['15m'] || null;
+  const volD    = _gateVolSpike(klines1H);
+  const trending = _gateADXTrending(h4 || h1);
+  let g4Pass = true, g4Warn = false;
+  let g4Detail = volD.ratio > 0
+    ? `${volD.spike ? '⚡ Spike' : 'Normal'} (${volD.ratio.toFixed(1)}x avg)`
+    : 'Volume data N/A';
+  if (!trending) {
+    // Ranging market — require spike for breakout trade
+    g4Pass = volD.spike;
+    g4Warn = !volD.spike;
+    if (!volD.spike) g4Detail += ' — spike needed (ranging mkt)';
+  }
+
+  // ── GATE 5: Risk:Reward ≥ 1:1.5 ────────────────────────
+  const atrVal = h1?.atr || h4?.atr || price * 0.015;
+  const tp1 = signal === 'bull' ? price + atrVal * 1.5 : price - atrVal * 1.5;
+  const sl  = signal === 'bull' ? price - atrVal       : price + atrVal;
+  const rr  = Math.abs(tp1 - price) / (Math.abs(sl - price) || 1);
+  const tp2 = signal === 'bull' ? price + atrVal * 3   : price - atrVal * 3;
+  const g5Pass = rr >= 1.4;
+  const g5Detail = `R:R = 1:${rr.toFixed(2)}${rr < 1.4 ? ' (min 1:1.5 needed)' : ' ✓'}`;
+
+  // ── Build gate objects ───────────────────────────────────
+  const gates = [
+    _g('📅', 'HTF Bias',    g1Pass?'pass':g1Warn?'warn':'fail', g1Pass?'✅ PASS':g1Warn?'⚠️ WARN':'❌ FAIL', g1Detail),
+    _g('📊', 'RSI Zone',    g2Pass?'pass':g2Warn?'warn':'fail', g2Pass?'✅ PASS':g2Warn?'⚠️ WARN':'❌ FAIL', g2Detail),
+    _g('⚡', 'MACD Dir',    g3Pass?'pass':g3Warn?'warn':'fail', g3Pass?'✅ PASS':g3Warn?'⚠️ WARN':'❌ FAIL', g3Detail),
+    _g('📦', 'Volume',      g4Pass?'pass':g4Warn?'warn':'fail', g4Pass?'✅ PASS':g4Warn?'⚠️ WARN':'❌ FAIL', g4Detail),
+    _g('⚖️', 'R:R ≥ 1:1.5', g5Pass?'pass':'fail',              g5Pass?'✅ PASS':'❌ FAIL',                  g5Detail),
+  ];
+
+  const strictPassed = [g1Pass, g2Pass, g3Pass, g4Pass, g5Pass].filter(Boolean).length;
+  const softPassed   = [g1Pass||g1Warn, g2Pass, g3Pass||g3Warn, g4Pass, g5Pass].filter(Boolean).length;
+
+  return _buildGateResult(gates, strictPassed, softPassed, { tp1, tp2, sl, rr, atr:atrVal }, signal, price, assetType);
+}
+
+function _g(icon, name, cls, status, detail) {
+  return { icon, name, cls, status, detail };
+}
+
+function _buildGateResult(gates, strictPassed, softPassed, trade, signal, price, assetType) {
+  return { gates, strictPassed, softPassed, trade, signal, price, assetType };
+}
+
+// ── Render Gate Panel ─────────────────────────────────────────
+function renderGateFilter(gateResult) {
+  const card = document.getElementById('gateFilterCard');
+  if (!card) return;
+
+  card.style.display = 'block';
+
+  // Asset badge
+  const badge = document.getElementById('gateAssetBadge');
+  if (badge) {
+    const label = gateResult.assetType === 'crypto' ? '₿ BTC'
+                : gateResult.assetType === 'gold'   ? 'Au GOLD'
+                : gateResult.assetType === 'forex'  ? 'FX'
+                : gateResult.assetType?.toUpperCase() || '';
+    const bgMap  = { crypto:'rgba(247,147,26,.12)', gold:'rgba(247,147,26,.12)', forex:'rgba(59,130,246,.12)' };
+    const clrMap = { crypto:'#f7931a', gold:'#f7931a', forex:'#3d8eff' };
+    badge.style.background   = bgMap[gateResult.assetType]  || 'rgba(255,255,255,.06)';
+    badge.style.color        = clrMap[gateResult.assetType] || '#dde3f5';
+    badge.style.border       = `1px solid ${clrMap[gateResult.assetType] || '#1a1f32'}55`;
+    badge.textContent        = label;
+  }
+
+  // Gate cards
+  const grid = document.getElementById('gateGrid');
+  if (grid) {
+    grid.innerHTML = gateResult.gates.map(g => `
+      <div class="gate-item gate-${g.cls}">
+        <div class="gate-icon-large">${g.icon}</div>
+        <div class="gate-name-txt">${g.name}</div>
+        <div class="gate-status-txt ${g.cls === 'na' ? 'na' : g.cls === 'pass' ? 'pass' : g.cls === 'warn' ? 'warn' : 'fail'}">${g.status}</div>
+        <div class="gate-detail-txt">${g.detail}</div>
+      </div>`).join('');
+  }
+
+  // Verdict
+  const verdict = document.getElementById('gateVerdict');
+  if (verdict) {
+    const sp = gateResult.strictPassed;
+    const t  = gateResult.trade;
+    const dir = gateResult.signal === 'bull' ? 'LONG 🚀' : gateResult.signal === 'bear' ? 'SHORT 🔻' : '—';
+
+    let cls = '', txt = '';
+    if (gateResult.signal === 'neutral' || !gateResult.signal) {
+      cls = 'gate-verdict-notrade';
+      txt = '⏸ NO TRADE — Signal নেই। Market direction এখনো clear না।';
+    } else if (sp >= 5) {
+      cls = 'gate-verdict-trade';
+      txt = `🚀 HIGH CONVICTION ${dir} — সব ৫টি গেট পাস! R:R = 1:${t?.rr?.toFixed(2)||'—'}। Trade নেওয়া যেতে পারে।`;
+    } else if (sp === 4) {
+      const failed = gateResult.gates.find(g => g.cls === 'fail');
+      cls = 'gate-verdict-wait';
+      txt = `⚠️ MODERATE (4/5 গেট পাস) — "${failed?.name || 'একটি গেট'}" fail। Confirmation এর অপেক্ষা করো।`;
+    } else if (sp === 3) {
+      cls = 'gate-verdict-wait';
+      txt = `⚠️ WEAK SETUP (${sp}/5 গেট পাস) — Setup এখনো পরিপক্ক না। Wait করো।`;
+    } else {
+      cls = 'gate-verdict-notrade';
+      txt = `❌ NO TRADE (${sp}/5 গেট পাস) — Setup poor। এই signal এ enter করো না।`;
+    }
+
+    verdict.className = cls;
+    verdict.innerHTML = `<span>${txt}</span>`;
+
+    // Trade details if high conviction
+    if (sp >= 4 && t && gateResult.price) {
+      const fmtP = v => Number(v) > 1000
+        ? Number(v).toLocaleString('en-US', {maximumFractionDigits:0})
+        : Number(v).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:4});
+      verdict.innerHTML += `
+        <div style="margin-top:8px;display:flex;flex-wrap:wrap;gap:8px;font-size:11px;opacity:.85">
+          <span style="background:rgba(5,229,122,.1);padding:3px 8px;border-radius:5px;color:var(--green)">TP1: ${fmtP(t.tp1)}</span>
+          <span style="background:rgba(5,229,122,.08);padding:3px 8px;border-radius:5px;color:var(--green)">TP2: ${fmtP(t.tp2)}</span>
+          <span style="background:rgba(255,45,85,.1);padding:3px 8px;border-radius:5px;color:var(--red)">SL: ${fmtP(t.sl)}</span>
+        </div>`;
+    }
+  }
+}
+
+// ── Hook into existing runAnalysis ───────────────────────────
+// We patch the existing renderTPSL / renderBestRec calls by
+// observing when masterScoreCard is updated (cheapest injection point).
+// The real approach: we override renderMasterScore to also trigger gates.
+(function _patchGateHook() {
+  const _origRenderMasterScore = window.renderMasterScore || function(){};
+
+  // Wait for renderMasterScore to be defined (it's defined later in the same script)
+  function _tryPatch() {
+    if (typeof renderMasterScore === 'function') {
+      const original = renderMasterScore;
+      // eslint-disable-next-line no-global-assign
+      renderMasterScore = function(masterData) {
+        original(masterData);
+        _triggerGateRender();
+      };
+    } else {
+      setTimeout(_tryPatch, 100);
+    }
+  }
+  _tryPatch();
+})();
+
+function _triggerGateRender() {
+  try {
+    // Pull what we need from globals set by runAnalysis
+    const results    = typeof dashboardCache !== 'undefined' && currentAsset?.symbol
+                       ? dashboardCache[currentAsset.symbol]?.results
+                       : null;
+    const price      = typeof currentPrice !== 'undefined' ? currentPrice : 0;
+    const assetType  = typeof currentAsset !== 'undefined' ? currentAsset?.type : 'crypto';
+
+    if (!results || !price) return;
+
+    // Determine dominant signal from TF results (same logic as renderGauge)
+    let tb = 0, tr = 0, tw = 0;
+    const TF_WEIGHTS = { '5m':0.5,'15m':0.8,'1H':1.0,'4H':1.4,'1D':1.8,'1W':2.0 };
+    for (const [label, r] of Object.entries(results)) {
+      const w = TF_WEIGHTS[label] || 1;
+      if (!r) continue;
+      tb += (r.bullPct || 0) * w;
+      tr += (r.bearPct || 0) * w;
+      tw += w;
+    }
+    const avgBull = tw > 0 ? tb / tw : 50;
+    const signal  = avgBull >= 60 ? 'bull' : avgBull <= 40 ? 'bear' : 'neutral';
+
+    // Get raw klines from cache — klineResults is an array indexed by TIMEFRAMES order
+    // Build a label-keyed map for gate functions
+    const _klinesArr = typeof dashboardCache !== 'undefined' && currentAsset?.symbol
+                       ? dashboardCache[currentAsset.symbol]?.klineResults
+                       : null;
+    const rawKlines = {};
+    if (_klinesArr && typeof TIMEFRAMES !== 'undefined') {
+      TIMEFRAMES.forEach((tf, i) => {
+        if (_klinesArr[i]?.data) rawKlines[tf.label] = _klinesArr[i].data;
+      });
+    }
+
+    // Only show gate filter for BTC and Gold
+    const supportedTypes = ['crypto', 'gold'];
+    if (!supportedTypes.includes(assetType)) {
+      const card = document.getElementById('gateFilterCard');
+      if (card) card.style.display = 'none';
+      return;
+    }
+
+    const gateResult = calcGateFilter(results, signal, price, rawKlines, assetType);
+    renderGateFilter(gateResult);
+  } catch (e) {
+    console.warn('[GateFilter] Error:', e);
+  }
+}
 </script>
 
 <!-- HOT SESSIONS — BUTTON + CENTERED MODAL -->
