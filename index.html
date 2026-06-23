@@ -2105,7 +2105,7 @@ function calcMFI(candles, period=14) {
       // tp === prevTP: skip — zero-change money flow is neither positive nor negative
     }
     if(totalVol === 0) return null; // No volume data — return null instead of misleading value
-    if(negFlow === 0) return {value:100, signal:'bear'};
+    if(negFlow === 0) return {value:100, signal:'bull'}; // zero selling = pure buying pressure = bullish
     const mfi = 100 - (100 / (1 + posFlow / negFlow));
     // MFI > 80 = strong buying (bullish), MFI < 20 = strong selling (bearish)
     const signal = mfi > 80 ? 'bull' : mfi < 20 ? 'bear' : 'neutral';
@@ -2315,7 +2315,10 @@ function calcCVD(candles) {
     // Divergence: price up but CVD down (bearish) or price down but CVD up (bullish)
     const priceUp = candles[len-1].c > candles[Math.max(0,len-10)].c;
     const cvdUp = cvdSeries[len-1] > cvdSeries[Math.max(0,len-10)];
-    const divergence = (priceUp && !cvdUp) || (!priceUp && cvdUp);
+    // Return typed divergence so CVD score reversal direction is correct
+    const divergence = (priceUp && !cvdUp) ? 'bearish'
+                     : (!priceUp && cvdUp) ? 'bullish'
+                     : false;
     return {value: cvd, trend, divergence};
   } catch(_){ return {value:0, trend:'neutral', divergence:false}; }
 }
@@ -2397,18 +2400,19 @@ function detectHarmonics(candles) {
 
     // Gartley: AB ≈ 0.618 XA, BC ≈ 0.618-0.786 AB, CD ≈ 1.272-1.618 BC
     if(abRatio > 0.55 && abRatio < 0.70 && bcRatio > 0.55 && bcRatio < 0.85 && cdRatioBC > 1.1 && cdRatioBC < 1.8){
-      const isBull = X.type === 'high'; // X high → D low = bullish reversal
+      // Bullish: D is a swing low (buy zone). Bearish: D is a swing high (sell zone).
+      const isBull = D.type === 'low';
       patterns.push({name:'Gartley', type: isBull ? 'bullish' : 'bearish', dPoint: D.price, reliability: (abRatio > 0.60 && abRatio < 0.65) ? 'high' : 'medium'});
     }
     // Butterfly: AB ≈ 0.786 XA, BC ≈ 0.618-0.786 AB, CD ≈ 1.27-1.618 AB
     const cdRatioAB = CD / AB;
     if(abRatio > 0.70 && abRatio < 0.88 && bcRatio > 0.55 && bcRatio < 0.85 && cdRatioAB > 1.15 && cdRatioAB < 1.75){
-      const isBull = X.type === 'high';
+      const isBull = D.type === 'low';
       patterns.push({name:'Butterfly', type: isBull ? 'bullish' : 'bearish', dPoint: D.price, reliability: (abRatio > 0.75 && abRatio < 0.82) ? 'high' : 'medium'});
     }
     // Bat: AB ≈ 0.382-0.5 XA, BC ≈ 0.382-0.886 AB, CD ≈ 1.618-2.618 AB
     if(abRatio > 0.32 && abRatio < 0.55 && bcRatio > 0.35 && bcRatio < 0.92 && cdRatioAB > 1.5 && cdRatioAB < 2.8){
-      const isBull = X.type === 'high';
+      const isBull = D.type === 'low';
       patterns.push({name:'Bat', type: isBull ? 'bullish' : 'bearish', dPoint: D.price, reliability: (abRatio > 0.38 && abRatio < 0.50) ? 'high' : 'low'});
     }
 
@@ -2448,10 +2452,11 @@ function analyzeTF(rawData, price) {
   // Core indicator signals
   // RSI: only add weight when directional (dead zone 40-60 adds no weight — doesn't inflate denominator)
   if(ri!=null){
-    if(ri<30){total+=2;bull+=2;}
-    else if(ri<40){total+=2;bull+=1;}     // expanded bull zone
-    else if(ri>70){total+=2;bear+=2;}
-    else if(ri>60){total+=2;bear+=1;}     // expanded bear zone
+    // RSI weight reduced from 2→1.5 to avoid double-counting with Stochastic (both are oscillators)
+    if(ri<30){total+=1.5;bull+=1.5;}
+    else if(ri<40){total+=1;bull+=0.8;}
+    else if(ri>70){total+=1.5;bear+=1.5;}
+    else if(ri>60){total+=1;bear+=0.8;}
     // 40-60 = true neutral, no weight added
   }
   // Moving averages: use add3 with near-equal = neutral (within 0.1% of price)
@@ -2477,7 +2482,8 @@ function analyzeTF(rawData, price) {
     else if(stK>70){total+=2;bear+=1;}   // approaching overbought
     // 30-70 = neutral zone, no weight added
   }
-  if(stK!=null && stD!=null){ add3(stK>stD?'bull':'bear', 1); }
+  // %K/%D crossover only meaningful in extreme zones — mid-range crossovers are noise
+  if(stK!=null && stD!=null && (stK<30 || stK>70)){ add3(stK>stD?'bull':'bear', 1); }
   if(vw && vw>0){ const rel=Math.abs(price-vw)/vw; if(rel<nearPct){/* neutral */} else add3(price>vw?'bull':'bear'); }
   if(mc) add3(mc.positive?'bull':'bear');
   if(mc && mc.histogram && mc.histogram.length>=2){
@@ -2493,13 +2499,13 @@ function analyzeTF(rawData, price) {
     if(diDiff < 2) { /* DI lines too close — neutral */ }
     else add3(adxData.plusDI>adxData.minusDI?'bull':'bear', 2);
     // In ranging market, reduce signal confidence
-    if(adxData.regime==='ranging'||adxData.regime==='weak'){ total+=1; bull+=0.5; bear+=0.5; }
+    // Ranging/weak market: reduce overall conviction but don't bias direction — simply don't add weight
   }
   // Ichimoku: above cloud + TK cross = strong bullish
   if(ichiData){
     if(ichiData.signal==='bull'){ bull+=2; total+=2; }
     else if(ichiData.signal==='bear'){ bear+=2; total+=2; }
-    else { bull+=1; bear+=1; total+=2; }
+    // neutral (in cloud): no weight — direction unclear
   }
   // OBV: trend confirmation + divergence
   if(obvData){
@@ -6927,7 +6933,9 @@ async function runAnalysis() {
     let cvdScore = 50;
     if(currentAsset.type === 'crypto'){
       cvdScore = cvdData.trend==='bullish' ? 75 : cvdData.trend==='bearish' ? 25 : 50;
-      if(cvdData.divergence) cvdScore = cvdData.trend==='bullish' ? 35 : 65; // divergence reverses
+      // Use typed divergence: bearish div on bullish trend → score down; bullish div on bearish trend → score up
+      if(cvdData.divergence === 'bearish') cvdScore = 30;  // price up, CVD down = smart money distributing
+      else if(cvdData.divergence === 'bullish') cvdScore = 70; // price down, CVD up = smart money accumulating
     }
     // Whale Score
     let whaleScore = 50;
@@ -8404,12 +8412,16 @@ function _gateVolSpike(candles) {
 }
 
 function _gateADXTrending(tfResult) {
-  /* Returns true when ADX > 25 (trend strong enough to skip volume requirement) */
+  /* Returns true when market is trending (ADX > 25) — volume spike not required in trending markets */
   if (!tfResult) return false;
-  // analyzeTF stores adxData inside result — check common keys
-  const adx = tfResult.adxData || tfResult.adx;
-  if (!adx) return false;
-  return (adx.adx || adx.value || 0) > 25;
+  // analyzeTF stores adx data under tfResult.adx (key from analyzeTF return object)
+  const adxObj = tfResult.adx;
+  if (!adxObj) return false;
+  // Prefer regime string check — more reliable than numeric threshold
+  if (adxObj.regime === 'trend' || adxObj.regime === 'strong_trend') return true;
+  // Fallback: numeric ADX value check
+  const adxVal = typeof adxObj.adx === 'number' ? adxObj.adx : 0;
+  return adxVal > 25;
 }
 
 // ── Main Gate Calculator ──────────────────────────────────────
