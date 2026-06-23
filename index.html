@@ -3504,7 +3504,7 @@ function renderTPSL(bestTF, results, price) {
       <div class="tpsl-box entry"><div class="tpsl-label">Entry Zone</div><div class="tpsl-price entry">${fmtPrice(price)}</div><div class="tpsl-pct">Current Price</div></div>
       <div class="tpsl-box tp1"><div class="tpsl-label">Take Profit 1</div><div class="tpsl-price tp">${fmtPrice(r.tp1)}</div><div class="tpsl-pct" style="color:var(--green)">${p1>0?'+':''}${p1}%</div></div>
       <div class="tpsl-box tp2"><div class="tpsl-label">Take Profit 2</div><div class="tpsl-price tp">${fmtPrice(r.tp2)}</div><div class="tpsl-pct" style="color:var(--green)">${p2>0?'+':''}${p2}%</div></div>
-      <div class="tpsl-box sl"><div class="tpsl-label">Stop Loss</div><div class="tpsl-price sl">${fmtPrice(r.sl)}</div><div class="tpsl-pct" style="color:var(--red)">-${Math.abs(ps)}%</div></div>
+      <div class="tpsl-box sl"><div class="tpsl-label">Stop Loss</div><div class="tpsl-price sl">${fmtPrice(r.sl)}</div><div class="tpsl-pct" style="color:var(--red)">${r.signal==='bear' ? '+' : '-'}${Math.abs(ps)}%</div></div>
     </div>
     <div class="prob-display">
       <div class="prob-item"><div class="prob-item-val" style="color:var(--green)">${r.bullPct}%</div><div class="prob-item-label">📈 Bullish</div></div>
@@ -7166,7 +7166,18 @@ async function runAnalysis() {
 
     // ── Trade Journal: auto-log signal + check open trades ────────
     try {
-      autoLogTrade(results, bestTF, currentPrice, masterScore, currentAsset);
+      // Compute gate result for journal logging (BTC/Gold only)
+      let _gateResultForLog = null;
+      if(currentAsset.type === 'crypto' || currentAsset.type === 'gold') {
+        try {
+          const _klinesForLog = {};
+          if(klineResults) TIMEFRAMES.forEach((tf,i) => { if(klineResults[i]?.data) _klinesForLog[tf.label]=klineResults[i].data; });
+          const _bestR = results[bestTF];
+          const _sig = _bestR?.signal || 'neutral';
+          _gateResultForLog = calcGateFilter(results, _sig, currentPrice, _klinesForLog, currentAsset.type);
+        } catch(_) {}
+      }
+      autoLogTrade(results, bestTF, currentPrice, masterScore, currentAsset, _gateResultForLog);
       checkOpenTrades(currentPrice, currentAsset);
       _tjCheckHistorical().catch(()=>{}); // check candle history for closed-browser period
     } catch(e3) { console.warn('[TradeJournal] hook error:', e3); }
@@ -7940,7 +7951,7 @@ function tjSetTab(tab) {
 }
 
 // ── Auto-log trade after analysis ────────────────────────────
-function autoLogTrade(results, bestTF, price, masterScoreVal, asset) {
+function autoLogTrade(results, bestTF, price, masterScoreVal, asset, gateResult) {
   try {
     const r = results[bestTF];
     if(!r || !r.tp1 || !r.sl || !r.tp2) return;
@@ -7951,6 +7962,19 @@ function autoLogTrade(results, bestTF, price, masterScoreVal, asset) {
 
     const now = new Date();
     const dayNames = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
+
+    // Gate filter summary to store with trade
+    let gatesPassed = null, gatesTotal = 5, gateDetails = null;
+    if(gateResult) {
+      gatesPassed = gateResult.strictPassed;
+      gateDetails = gateResult.gates.map(g => ({
+        name: g.name,
+        icon: g.icon,
+        pass: g.cls === 'pass',
+        warn: g.cls === 'warn',
+        detail: g.detail
+      }));
+    }
 
     const trade = {
       id: Date.now(),
@@ -7973,6 +7997,9 @@ function autoLogTrade(results, bestTF, price, masterScoreVal, asset) {
       status: 'pending', // pending | win_tp1 | win_tp2 | loss
       closedAt: null,
       closedPrice: null,
+      gatesPassed,    // how many gates passed (0-5)
+      gatesTotal,     // always 5
+      gateDetails,    // array of {name, icon, pass, warn, detail}
     };
 
     trades.unshift(trade);
@@ -8095,7 +8122,20 @@ function _tjRenderTrades() {
               <div class="tj-price-val closed-c">${_tjFmt(t.closedPrice)}</div>
             </div>` : ''}
           </div>
-          <div class="tj-conf">Score: ${t.masterScore}/100${t.resolvedByHistory?' · <span style="color:var(--cyan);font-size:9px">📡 history verified</span>':''}</div>
+          <div class="tj-conf">Score: ${t.masterScore}/100${t.resolvedByHistory?' · <span style="color:var(--cyan);font-size:9px">📡 history verified</span>':''}
+          ${t.gateDetails ? `<div style="margin-top:5px;display:flex;gap:4px;flex-wrap:wrap">
+            ${t.gateDetails.map(g => `<span title="${g.name}: ${g.detail}" style="font-size:9px;padding:2px 5px;border-radius:4px;font-weight:700;
+              background:${g.pass?'rgba(5,229,122,.12)':g.warn?'rgba(255,195,0,.1)':'rgba(255,45,85,.1)'};
+              color:${g.pass?'var(--green)':g.warn?'var(--yellow)':'var(--red)'}">
+              ${g.icon} ${g.pass?'✓':g.warn?'~':'✗'}
+            </span>`).join('')}
+            <span style="font-size:9px;padding:2px 5px;border-radius:4px;font-weight:800;
+              background:${t.gatesPassed>=5?'rgba(5,229,122,.15)':t.gatesPassed>=4?'rgba(255,195,0,.12)':'rgba(255,45,85,.12)'};
+              color:${t.gatesPassed>=5?'var(--green)':t.gatesPassed>=4?'var(--yellow)':'var(--red)'}">
+              ${t.gatesPassed}/${t.gatesTotal} Gates
+            </span>
+          </div>` : ''}
+          </div>
         </div>
         <div style="text-align:right;white-space:nowrap">
           <span class="tj-status-badge ${SC[t.status]}">${SL[t.status]}</span>
@@ -8270,16 +8310,29 @@ async function _tjCheckHistorical() {
 
       let outcome = null, outcomeTime = null, outcomePrice = null;
 
+      // Check each candle — TP checked BEFORE SL (conservative but realistic;
+      // if both hit in same candle, assume TP hit first on profitable move,
+      // then SL. Only exception: if open already past SL — immediate loss.)
       for(const c of candles) {
-        const openTime = c[0], high = +c[2], low = +c[3];
+        const openTime = c[0], high = +c[2], low = +c[3], open = +c[1];
         if(trade.direction === 'LONG') {
-          if(low  <= +trade.sl)  { outcome='loss';    outcomeTime=openTime; outcomePrice=+trade.sl;  break; }
+          // If candle opened below SL — gapped down, immediate loss
+          if(open <= +trade.sl) { outcome='loss'; outcomeTime=openTime; outcomePrice=+trade.sl; break; }
+          // TP2 hit
           if(high >= +trade.tp2) { outcome='win_tp2'; outcomeTime=openTime; outcomePrice=+trade.tp2; break; }
+          // TP1 hit (price went up first)
           if(high >= +trade.tp1) { outcome='win_tp1'; outcomeTime=openTime; outcomePrice=+trade.tp1; break; }
-        } else {
+          // SL hit (price only went down)
+          if(low <= +trade.sl)   { outcome='loss';    outcomeTime=openTime; outcomePrice=+trade.sl;  break; }
+        } else { // SHORT
+          // If candle opened above SL — gapped up, immediate loss
+          if(open >= +trade.sl) { outcome='loss'; outcomeTime=openTime; outcomePrice=+trade.sl; break; }
+          // TP2 hit (price went further down)
+          if(low <= +trade.tp2)  { outcome='win_tp2'; outcomeTime=openTime; outcomePrice=+trade.tp2; break; }
+          // TP1 hit
+          if(low <= +trade.tp1)  { outcome='win_tp1'; outcomeTime=openTime; outcomePrice=+trade.tp1; break; }
+          // SL hit (price went up)
           if(high >= +trade.sl)  { outcome='loss';    outcomeTime=openTime; outcomePrice=+trade.sl;  break; }
-          if(low  <= +trade.tp2) { outcome='win_tp2'; outcomeTime=openTime; outcomePrice=+trade.tp2; break; }
-          if(low  <= +trade.tp1) { outcome='win_tp1'; outcomeTime=openTime; outcomePrice=+trade.tp1; break; }
         }
       }
 
