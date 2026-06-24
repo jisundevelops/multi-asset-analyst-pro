@@ -2281,11 +2281,12 @@ function detectMarketRegime(adxData, atrPct, bbWidth, volumeTrend) {
     if(adxVal > 25 && atr > 1.5 && bbW > 0.02 && volT > 1.1) return 'TRENDING';
     // RANGING: ADX < 20, ATR% < 0.8%, BB narrow, volume below avg
     if(adxVal < 20 && atr < 0.8 && bbW < 0.015 && volT < 0.9) return 'RANGING';
-    // BREAKOUT: ADX crossing 20→30, ATR spike, BB squeeze→expand, volume spike
+    // BREAKOUT: ADX 20→30 range, ATR spike, volume spike — momentum building
     if(adxVal >= 20 && adxVal <= 30 && atr > 1.2 && volT > 1.5) return 'BREAKOUT';
-    // REVERSAL: ADX declining from >30, ATR shrinking, BB contracting
-    if(adxVal < 30 && adxVal > 15 && atr < 1.0 && bbW < 0.02) return 'REVERSAL';
-    // Default fallback
+    // REVERSAL: ADX must be clearly below trend threshold (< 22, not just < 30)
+    // and ATR contracting — this avoids misclassifying ADX 25-30 as reversal
+    if(adxVal < 22 && adxVal > 15 && atr < 1.2 && bbW < 0.025) return 'REVERSAL';
+    // Default fallback — use ADX as primary determinant
     if(adxVal > 25) return 'TRENDING';
     if(adxVal < 20) return 'RANGING';
     return 'RANGING';
@@ -2468,10 +2469,10 @@ function analyzeTF(rawData, price) {
   // Bollinger Bands: only add weight when directional (dead zone 0.35-0.65 adds no weight)
   if(bband){
     const bbRange=bband.upper-bband.lower;const pos=bbRange!==0?(price-bband.lower)/bbRange:0.5;
-    if(pos<0.2){total+=2;bull+=2;}
-    else if(pos<0.35){total+=2;bull+=1;}  // expanded bull zone
-    else if(pos>0.8){total+=2;bear+=2;}
-    else if(pos>0.65){total+=2;bear+=1;}  // expanded bear zone
+    if(pos<0.2){total+=2;bull+=2;}             // near/below lower band = strong bullish
+    else if(pos<0.35){total+=1;bull+=1;}        // approaching lower band = mild bullish
+    else if(pos>0.8){total+=2;bear+=2;}         // near/above upper band = strong bearish
+    else if(pos>0.65){total+=1;bear+=1;}        // approaching upper band = mild bearish
     // 0.35-0.65 = true neutral, no weight added
   }
   // Stochastic: mean-reversion logic (like RSI) — oversold=bullish, overbought=bearish
@@ -2490,7 +2491,8 @@ function analyzeTF(rawData, price) {
     const h=mc.histogram;
     add3(h[h.length-1]>h[h.length-2]?'bull':'bear', 1);
   }
-  const l5=closes.slice(-5); add3(l5[l5.length-1]>l5[0]?'bull':'bear');
+  // Short-term momentum (last 5 candles) — low weight, noisy on higher TFs
+  const l5=closes.slice(-5); add3(l5[l5.length-1]>l5[0]?'bull':'bear', 0.3);
 
   // Advanced indicator signals (weight: 2 each for ADX + Ichimoku)
   // ADX: +DI > -DI = bullish; near-equal = neutral (no directional bias)
@@ -3365,7 +3367,7 @@ function calculateMasterScore(components) {
                       'Candlestick Pattern','CCI','MFI','Williams %R','Divergence','Market Regime',
                       'Volume Score','CVD/Order Flow','Whale Activity','Squeeze Momentum',
                       'SMC (OB/FVG/BOS)','Harmonic Patterns','Fibonacci Zone','Pivot Points',
-                      'S/R Position','Liquidity Sweep','Fear & Greed','Long/Short & OB',
+                      'S/R Position','Liquidity Sweep','Fear & Greed (Contrarian)','Long/Short & OB',
                       'Cross-Asset Impact','Macro Environment','Backtest Validation',
                       'On-Chain Intelligence','AI Signal Engine'];
 
@@ -6791,8 +6793,17 @@ async function runAnalysis() {
         const keyLevels = fibData.levels.filter(l => l.isKeyZone);
         if(keyLevels.length > 0){
           const nearestKey = keyLevels.sort((a,b) => a.dist - b.dist)[0];
-          if(currentPrice > nearestKey.price) fibScore = 75; // support held
-          else fibScore = 40; // rejected at key zone
+          const distPct = nearestKey.dist / currentPrice; // distance as % of price
+          // Price ABOVE key Fib = support held → bullish
+          // Price BELOW key Fib = rejected / under resistance → bearish lean
+          // Distance matters: very close to level = high confidence signal
+          if(currentPrice > nearestKey.price) {
+            // Support held — closer = more bullish (within 0.5% = very strong signal)
+            fibScore = distPct < 0.005 ? 85 : distPct < 0.015 ? 75 : 65;
+          } else {
+            // Below key Fib level — acting as resistance
+            fibScore = distPct < 0.005 ? 20 : distPct < 0.015 ? 30 : 40;
+          }
         }
       }
     } catch(_){ fibScore = 50; }
@@ -6914,7 +6925,7 @@ async function runAnalysis() {
     if(bestRegime === 'TRENDING') regimeScore = bestADX && bestADX.plusDI > bestADX.minusDI ? 80 : 20;
     else if(bestRegime === 'RANGING') regimeScore = 50;
     else if(bestRegime === 'BREAKOUT') regimeScore = volData.spike ? 70 : 50;
-    else if(bestRegime === 'REVERSAL') regimeScore = 55;
+    else if(bestRegime === 'REVERSAL') regimeScore = 50; // direction unknown in reversal — no bias
 
     // ── Phase 2: CVD, Whale, Harmonics ────────────────────────────
     let cvdData = {value:0, trend:'neutral', divergence:false};
