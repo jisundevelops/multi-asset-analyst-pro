@@ -8169,9 +8169,13 @@ function checkOpenTrades(currentPriceVal, asset) {
     let changed = false;
     const now = new Date().toISOString();
 
+    const _now = Date.now();
     trades.forEach(t => {
       if(t.status !== 'pending') return;
       if(t.asset !== asset.displayName) return;
+      // Skip trades younger than 2 minutes — price hasn't moved yet
+      // (prevents same-candle instant win/loss from entry price)
+      if(_now - new Date(t.timestamp).getTime() < 2 * 60 * 1000) return;
 
       if(t.direction === 'LONG') {
         if(currentPriceVal >= +t.tp2)      { t.status='win_tp2'; t.closedAt=now; t.closedPrice=currentPriceVal; changed=true; }
@@ -8440,11 +8444,15 @@ function _tjRenderAnalytics() {
 // ── Historical candle check (when browser was closed) ─────────
 async function _tjCheckHistorical() {
   const trades = _tjLoad();
-  const cutoff = Date.now() - 2 * 60 * 1000; // trades older than 2 min
+  const _nowMs = Date.now();
+  // Only check trades older than 5 minutes — ensures at least 1 full candle has closed.
+  // Trades < 5 min are handled by live checkOpenTrades (price polling).
+  // lastHistoricalCheck cooldown: 10 min to avoid hammering API.
+  const cutoff = _nowMs - 5 * 60 * 1000;
   const toCheck = trades.filter(t =>
     t.status === 'pending' &&
     new Date(t.timestamp).getTime() < cutoff &&
-    (!t.lastHistoricalCheck || Date.now() - t.lastHistoricalCheck > 5 * 60 * 1000)
+    (!t.lastHistoricalCheck || _nowMs - t.lastHistoricalCheck > 10 * 60 * 1000)
   );
   if(!toCheck.length) return;
 
@@ -8452,9 +8460,18 @@ async function _tjCheckHistorical() {
 
   for(const trade of toCheck) {
     try {
-      const startMs = new Date(trade.timestamp).getTime();
+      const entryMs = new Date(trade.timestamp).getTime();
       const endMs   = Date.now();
-      const ageMs   = endMs - startMs;
+      const ageMs   = endMs - entryMs;
+
+      // Skip entry candle: advance startMs by 1 candle-interval
+      // so the first candle checked is the one AFTER entry opened.
+      // Without this, the entry candle's wick touching SL = false loss.
+      const _intervalMs = ageMs < 2*3600000 ? 60000        // 1m = 60s
+                        : ageMs < 12*3600000 ? 5*60000      // 5m
+                        : ageMs < 7*86400000 ? 15*60000     // 15m
+                        : 3600000;                           // 1h
+      const startMs = entryMs + _intervalMs; // skip entry candle
 
       const candles = await _tjFetchHistoricalCandles(trade, startMs, endMs, ageMs);
       if(!candles || !candles.length) continue;
@@ -8529,8 +8546,12 @@ async function _tjFetchHistoricalCandles(trade, startMs, endMs, ageMs) {
       const url  = `/api/td?_ep=time_series&symbol=${encodeURIComponent(trade.symbol)}&interval=${tdInterval}&start_date=${encodeURIComponent(fmt(startMs))}&outputsize=500`;
       const data = await tryFetch(url, 10000, 1);
       if(data && data.values && data.values.length) {
+        // Twelve Data datetime is in exchange local time (EST for Gold, UTC for crypto)
+        // We do NOT add 'Z' suffix — we only need OHLC values for TP/SL comparison.
+        // Timestamps are only used for outcome time logging, not for window filtering
+        // (the API itself handles the start_date/end_date filtering).
         return data.values.slice().reverse().map(v => [
-          new Date(v.datetime.replace(' ','T')+'Z').getTime(),
+          new Date(v.datetime.replace(' ','T')).getTime(), // no 'Z' — local time kept as-is
           +v.open, +v.high, +v.low, +v.close, 0
         ]);
       }
