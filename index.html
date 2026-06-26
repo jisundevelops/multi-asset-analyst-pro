@@ -2421,7 +2421,7 @@ function detectHarmonics(candles) {
   } catch(_){ return {patterns:[]}; }
 }
 
-function analyzeTF(rawData, price) {
+function analyzeTF(rawData, price, assetType) {
   const candles = rawData.map(k=>({h:+k[2],l:+k[3],c:+k[4],v:+k[5],o:+k[1]}));
   const closes  = candles.map(c=>c.c);
 
@@ -2542,12 +2542,37 @@ function analyzeTF(rawData, price) {
 
   const bullPct=total>0?Math.round(bull/total*100):50;
   const bearPct=100-bullPct;
-  const signal=bullPct>=60?'bull':bearPct>=60?'bear':'neutral';
+  // Asset-specific threshold: BTC is volatile (60% ok), Gold/Forex need higher conviction
+  const _thresh = (assetType==='gold'||assetType==='forex') ? 65 : 60;
+  const signal=bullPct>=_thresh?'bull':bearPct>=_thresh?'bear':'neutral';
   const prob=signal==='bull'?bullPct:signal==='bear'?bearPct:Math.max(bullPct,bearPct);
   const atrV=av||(price*0.015);
-  const tp1=signal==='bull'?price+atrV*1.5:signal==='bear'?price-atrV*1.5:price+atrV*0.75;
-  const tp2=signal==='bull'?price+atrV*3.0:signal==='bear'?price-atrV*3.0:price+atrV*1.5;
-  const sl2=signal==='bull'?price-atrV*1.0:signal==='bear'?price+atrV*1.0:price-atrV*0.5;
+
+  // Regime-adaptive TP/SL multipliers
+  // TRENDING:  let winners run — wide TP, normal SL
+  // RANGING:   price stays in range — tight TP, tight SL
+  // BREAKOUT:  momentum play — widest TP, slightly wider SL
+  // REVERSAL:  quick move — medium TP, tight SL (if wrong, get out fast)
+  const _reg = regime || 'RANGING';
+  const _tp1m = _reg==='TRENDING'  ? 2.0
+              : _reg==='RANGING'   ? 1.0
+              : _reg==='BREAKOUT'  ? 2.5
+              : _reg==='REVERSAL'  ? 1.5
+              : 1.5; // default
+  const _tp2m = _reg==='TRENDING'  ? 3.5
+              : _reg==='RANGING'   ? 1.8
+              : _reg==='BREAKOUT'  ? 4.0
+              : _reg==='REVERSAL'  ? 2.5
+              : 3.0; // default
+  const _slm  = _reg==='TRENDING'  ? 1.0
+              : _reg==='RANGING'   ? 0.7
+              : _reg==='BREAKOUT'  ? 1.2
+              : _reg==='REVERSAL'  ? 0.7
+              : 1.0; // default
+
+  const tp1=signal==='bull'?price+atrV*_tp1m:signal==='bear'?price-atrV*_tp1m:price+atrV*0.75;
+  const tp2=signal==='bull'?price+atrV*_tp2m:signal==='bear'?price-atrV*_tp2m:price+atrV*1.5;
+  const sl2=signal==='bull'?price-atrV*_slm :signal==='bear'?price+atrV*_slm :price-atrV*0.5;
 
   return {rsi:ri?.toFixed(1),sma20:s20!=null?smartToFixed(s20):null,sma50:s50!=null?smartToFixed(s50):null,
     ema21:e21!=null?smartToFixed(e21):null,bb:bband,atr:smartToFixed(atrV),stoch:stK?.toFixed(1),stochD:stD?.toFixed(1),
@@ -3433,17 +3458,44 @@ function renderMasterScore(masterData) {
 
 // ── RENDER ──────────────────────────────────────────────────────
 function renderTFCards(results) {
-  // Best TF only from tradeable timeframes (5m, 15m, 1H, 4H)
-  const TRADEABLE_TFS = ['5m','15m','1H','4H'];
-  let bestTF=null,bestScore=0;
-  for(const [tf,r] of Object.entries(results)){
-    if(!TRADEABLE_TFS.includes(tf)) continue; // skip 1D, 1W for best selection
-    if(r.signal!=='neutral'&&r.prob>bestScore){bestScore=r.prob;bestTF=tf;}
+  // ── HTF Bias Detection ───────────────────────────────────────
+  // 4H and 1D are HTF reference frames. If they agree → strong bias.
+  // bestTF signal must align with HTF bias; counter-trend signals
+  // are demoted (confidence penalty applied in renderBestRec).
+  const r4H = results['4H'], r1D = results['1D'], r1W = results['1W'];
+  let htfBias = 'neutral'; // 'bull' | 'bear' | 'neutral'
+  if(r1D && r4H && r1D.signal !== 'neutral' && r4H.signal !== 'neutral') {
+    if(r1D.signal === r4H.signal) htfBias = r1D.signal;        // 4H + 1D agree → strong bias
+    else if(r1D.signal !== 'neutral') htfBias = r1D.signal;    // 1D overrides if split
+  } else if(r1D && r1D.signal !== 'neutral') {
+    htfBias = r1D.signal;
+  } else if(r4H && r4H.signal !== 'neutral') {
+    htfBias = r4H.signal;
   }
-  if(!bestTF){for(const [tf,r] of Object.entries(results)){
+
+  // ── bestTF Selection: HTF-aligned signal preferred ───────────
+  // Score = prob + HTF alignment bonus (20pts if aligned, -20pts if counter)
+  const TRADEABLE_TFS = ['5m','15m','1H','4H'];
+  let bestTF=null, bestScore=-Infinity;
+  for(const [tf,r] of Object.entries(results)){
     if(!TRADEABLE_TFS.includes(tf)) continue;
-    if(r.prob>bestScore){bestScore=r.prob;bestTF=tf;}
-  }}
+    if(r.signal==='neutral') continue; // skip neutral — no direction
+    const htfBonus = htfBias === 'neutral' ? 0
+                   : r.signal === htfBias   ? 20   // aligned with HTF → bonus
+                   :                         -20;  // counter-trend → penalty
+    const adjustedScore = r.prob + htfBonus;
+    if(adjustedScore > bestScore){ bestScore = adjustedScore; bestTF = tf; }
+  }
+  // Fallback: if no directional TF found, pick highest prob regardless
+  if(!bestTF){
+    let fbScore = 0;
+    for(const [tf,r] of Object.entries(results)){
+      if(!TRADEABLE_TFS.includes(tf)) continue;
+      if(r.prob > fbScore){ fbScore = r.prob; bestTF = tf; }
+    }
+  }
+  // Store htfBias on results object so renderBestRec can use it
+  results._htfBias = htfBias;
   const grid=$id('tfGrid'); if(!grid) return bestTF;
   grid.innerHTML='';
   for(const tf of TIMEFRAMES){
@@ -3464,6 +3516,58 @@ function renderTFCards(results) {
   return bestTF;
 }
 
+// ── Session Confidence Modifier ──────────────────────────────
+// BDT-based session detection (sessions already defined in SESS_SESSIONS)
+// Returns { multiplier, sessionName, warning }
+function getSessionConfidence(assetType) {
+  try {
+    const now = new Date();
+    const utcMs = now.getTime() + now.getTimezoneOffset() * 60000;
+    const bdt = new Date(utcMs + 6 * 3600000);
+    const bdtMins = bdt.getHours() * 60 + bdt.getMinutes();
+
+    // BDT session windows (SESS_SESSIONS uses BDT minutes)
+    // Overlap (London+NY) = best liquidity
+    const inOverlap  = bdtMins >= 1140 && bdtMins < 1380;
+    // London session
+    const inLondon   = bdtMins >= 840  && bdtMins < 1380;
+    // NY session (crosses midnight in BDT)
+    const inNY       = bdtMins >= 1140 || bdtMins < 240;
+    // Asia session
+    const inAsia     = bdtMins >= 360  && bdtMins < 900;
+    // Market quiet (dead zone)
+    const inQuiet    = bdtMins >= 240  && bdtMins < 360;
+
+    // BTC/Crypto: liquid in NY+London, less reliable in Asia, poor in quiet
+    if(assetType === 'crypto') {
+      if(inOverlap) return { multiplier:1.0, sessionName:'London+NY Overlap ⭐', warning:null };
+      if(inNY)      return { multiplier:1.0, sessionName:'NY Session 🗽', warning:null };
+      if(inLondon)  return { multiplier:0.9, sessionName:'London Session 🇬🇧', warning:null };
+      if(inAsia)    return { multiplier:0.8, sessionName:'Asia Session 🌏', warning:'Asia session: lower BTC liquidity — reduce position size' };
+      if(inQuiet)   return { multiplier:0.7, sessionName:'Market Quiet 💤', warning:'Dead zone: very low volume — avoid new entries' };
+    }
+    // Gold: best in London+NY (institutional), poor in Asia
+    if(assetType === 'gold') {
+      if(inOverlap) return { multiplier:1.0, sessionName:'London+NY Overlap ⭐', warning:null };
+      if(inLondon)  return { multiplier:1.0, sessionName:'London Session 🇬🇧', warning:null };
+      if(inNY)      return { multiplier:0.9, sessionName:'NY Session 🗽', warning:null };
+      if(inAsia)    return { multiplier:0.75, sessionName:'Asia Session 🌏', warning:'Asia session: Gold signals less reliable — lower conviction' };
+      if(inQuiet)   return { multiplier:0.65, sessionName:'Market Quiet 💤', warning:'Dead zone: avoid Gold trades' };
+    }
+    // Forex: session-dependent
+    if(assetType === 'forex') {
+      if(inOverlap) return { multiplier:1.0, sessionName:'London+NY Overlap ⭐', warning:null };
+      if(inLondon)  return { multiplier:1.0, sessionName:'London Session 🇬🇧', warning:null };
+      if(inNY)      return { multiplier:0.9, sessionName:'NY Session 🗽', warning:null };
+      if(inAsia)    return { multiplier:0.8, sessionName:'Asia Session 🌏', warning:'Asia session: USD pairs less liquid' };
+      if(inQuiet)   return { multiplier:0.65, sessionName:'Market Quiet 💤', warning:'Dead zone: avoid Forex trades' };
+    }
+    return { multiplier:1.0, sessionName:'Unknown', warning:null };
+  } catch(_) {
+    return { multiplier:1.0, sessionName:'', warning:null };
+  }
+}
+
 function renderBestRec(bestTF, results, marketStructureLine) {
   const r=results[bestTF];
   if(!r){setHTML('bestRec','<div style="color:var(--muted);font-size:12px">Insufficient data for best recommendation</div>');return;}
@@ -3473,6 +3577,34 @@ function renderBestRec(bestTF, results, marketStructureLine) {
     :'Market consolidation এ। Strong signal এর জন্য অপেক্ষা করো।';
   const col=r.signal==='bull'?'var(--green)':r.signal==='bear'?'var(--red)':'var(--yellow)';
   const msLine = marketStructureLine ? `<div class="best-rec-desc" style="margin-top:2px;font-size:11px;color:var(--cyan)">📊 ${marketStructureLine}</div>` : '';
+
+  // Session confidence modifier
+  const sessConf = getSessionConfidence(currentAsset?.type || 'crypto');
+  const adjProb = Math.round(r.prob * sessConf.multiplier);
+  const sessLine = sessConf.warning
+    ? `<div style="margin-top:4px;padding:4px 8px;border-radius:5px;font-size:10px;font-weight:700;
+        background:rgba(255,45,85,.08);border:1px solid rgba(255,45,85,.2);color:var(--red)">
+        ⚠️ ${sessConf.warning}
+       </div>`
+    : `<div style="margin-top:4px;font-size:10px;color:var(--muted)">
+        🕐 Session: ${sessConf.sessionName}
+       </div>`;
+
+  // HTF Bias warning — show if signal is counter-trend
+  const htfBias = results._htfBias || 'neutral';
+  const isCounterTrend = htfBias !== 'neutral' && r.signal !== 'neutral' && r.signal !== htfBias;
+  const htfLine = isCounterTrend
+    ? `<div style="margin-top:4px;padding:4px 8px;border-radius:5px;font-size:10px;font-weight:700;
+        background:rgba(255,195,0,.1);border:1px solid rgba(255,195,0,.3);color:var(--yellow)">
+        ⚠️ Counter-Trend: HTF (4H+1D) bias is ${htfBias.toUpperCase()} — extra caution needed
+       </div>`
+    : htfBias !== 'neutral'
+    ? `<div style="margin-top:4px;padding:4px 8px;border-radius:5px;font-size:10px;font-weight:700;
+        background:rgba(5,229,122,.08);border:1px solid rgba(5,229,122,.2);color:var(--green)">
+        ✅ HTF Aligned: 4H+1D bias is ${htfBias.toUpperCase()} — trade with trend
+       </div>`
+    : '';
+
   setHTML('bestRec',`
     <div class="best-rec-icon">${r.signal==='bull'?'🚀':r.signal==='bear'?'🔻':'⏸'}</div>
     <div class="best-rec-info">
@@ -3480,9 +3612,11 @@ function renderBestRec(bestTF, results, marketStructureLine) {
       <div class="best-rec-main" style="color:${col}">${bestTF} — ${dir}</div>
       <div class="best-rec-desc">${reason}</div>
       ${msLine}
+      ${sessLine}
+      ${htfLine}
     </div>
     <div class="best-rec-stats">
-      <div class="rec-stat"><div class="rec-stat-val" style="color:${col}">${r.prob}%</div><div class="rec-stat-label">Probability</div></div>
+      <div class="rec-stat"><div class="rec-stat-val" style="color:${col}">${adjProb}%</div><div class="rec-stat-label">Probability${sessConf.multiplier<1.0?'<div style="font-size:8px;color:var(--yellow)">session adj.</div>':''}</div></div>
       <div class="rec-stat"><div class="rec-stat-val" style="color:var(--cyan)">${fmtPrice(r.atr)}</div><div class="rec-stat-label">ATR</div></div>
       <div class="rec-stat"><div class="rec-stat-val" style="color:var(--yellow)">${r.rsi??'—'}</div><div class="rec-stat-label">RSI (14)</div></div>
     </div>`);
@@ -6413,7 +6547,7 @@ async function runAnalysis() {
         const fallbackResults = {};
         TIMEFRAMES.forEach(tf => {
           const fallbackData = _generateFallbackKlines(currentPrice, tf.interval);
-          fallbackResults[tf.label] = analyzeTF(fallbackData, currentPrice);
+          fallbackResults[tf.label] = analyzeTF(fallbackData, currentPrice, currentAsset?.type);
         });
         renderTFCards(fallbackResults);
         renderGauge(fallbackResults);
@@ -6579,7 +6713,7 @@ async function runAnalysis() {
     // Analyze
     setHTML('loaderText','Indicators calculate করছি<span class="dots"></span>');
     const results={};
-    TIMEFRAMES.forEach((tf,i)=>{ results[tf.label]=analyzeTF(klineResults[i].data, currentPrice); });
+    TIMEFRAMES.forEach((tf,i)=>{ results[tf.label]=analyzeTF(klineResults[i].data, currentPrice, currentAsset?.type); });
 
     // Render synchronous UI
     const bestTF=renderTFCards(results);
@@ -7968,6 +8102,12 @@ function autoLogTrade(results, bestTF, price, masterScoreVal, asset, gateResult)
     if(!r || !r.tp1 || !r.sl || !r.tp2) return;
     if(r.signal === 'neutral') return;
     if(r.prob < 65) return; // Confidence threshold: 65%
+
+    // Confluence gate: at least 3 out of 6 TFs must agree with bestTF signal
+    // Prevents logging trades where only 1 TF shows the signal
+    const _tfLabels = ['5m','15m','1H','4H','1D','1W'];
+    const _agreeTFs = _tfLabels.filter(tf => results[tf] && results[tf].signal === r.signal);
+    if(_agreeTFs.length < 3) return; // Not enough TF confluence — skip log
 
     const trades = _tjLoad();
 
