@@ -8095,6 +8095,42 @@ function tjSetTab(tab) {
   _tjRenderBody();
 }
 
+// ── Timeframe → millisecond helpers (used by dedup, live-check, history-check) ──
+// Candle duration for each tradeable timeframe (full candle).
+const TF_CANDLE_MS = {
+  '5m':  5  * 60 * 1000,
+  '15m': 15 * 60 * 1000,
+  '1H':  60 * 60 * 1000,
+  '4H':  4  * 60 * 60 * 1000,
+  '1D':  24 * 60 * 60 * 1000,
+  '1W':  7  * 24 * 60 * 60 * 1000,
+};
+// Half-candle window — used to suppress duplicate trade logging.
+// If a trade for the same asset+TF+direction was logged within this window,
+// we treat the new signal as the "same" trade and skip.
+const TF_HALF_MS = {
+  '5m':  2.5 * 60 * 1000,
+  '15m': 7.5 * 60 * 1000,
+  '1H':  30  * 60 * 1000,
+  '4H':  2   * 60 * 60 * 1000,
+  '1D':  12  * 60 * 60 * 1000,
+  '1W':  3.5 * 24 * 60 * 60 * 1000,
+};
+// History-check cadence per timeframe.
+//   5m  → every 30 min
+//   15m → every 2 hours
+//   1H  → every 4 hours
+//   4H  → every 16 hours
+//   1D/1W → sensible defaults so older trades still get verified.
+const TF_CHECK_INTERVAL_MS = {
+  '5m':  30 * 60 * 1000,
+  '15m': 2  * 60 * 60 * 1000,
+  '1H':  4  * 60 * 60 * 1000,
+  '4H':  16 * 60 * 60 * 1000,
+  '1D':  24 * 60 * 60 * 1000,
+  '1W':  7  * 24 * 60 * 60 * 1000,
+};
+
 // ── Auto-log trade after analysis ────────────────────────────
 function autoLogTrade(results, bestTF, price, masterScoreVal, asset, gateResult) {
   try {
@@ -8110,6 +8146,30 @@ function autoLogTrade(results, bestTF, price, masterScoreVal, asset, gateResult)
     if(_agreeTFs.length < 3) return; // Not enough TF confluence — skip log
 
     const trades = _tjLoad();
+
+    // ── Duplicate suppression ───────────────────────────────────
+    // After a trade for asset+TF+direction is logged, the same trade must NOT
+    // be logged again within half of the TF's candle interval.
+    //   5m  → 2.5 min   15m → 7.5 min   1H → 30 min   4H → 2 hours
+    // This prevents the tool from re-logging the same signal on every page
+    // refresh (the user's reported bug).
+    const _nowMs       = Date.now();
+    const _direction   = r.signal === 'bull' ? 'LONG' : 'SHORT';
+    const _dedupeMs    = TF_HALF_MS[bestTF] || (5 * 60 * 1000);
+    const _existingDup = trades.find(t =>
+      t.asset      === asset.displayName &&
+      t.timeframe  === bestTF            &&
+      t.direction  === _direction        &&
+      (_nowMs - new Date(t.timestamp).getTime()) < _dedupeMs
+    );
+    if(_existingDup) {
+      const _ageSec = Math.round((_nowMs - new Date(_existingDup.timestamp).getTime()) / 1000);
+      console.log(
+        `[TJ] Skip duplicate ${bestTF} ${asset.displayName} ${_direction} — ` +
+        `last logged ${_ageSec}s ago (dedup window ${_dedupeMs/1000}s)`
+      );
+      return; // duplicate — same trade, do not re-log
+    }
 
     const now = new Date();
     const dayNames = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
@@ -8173,9 +8233,13 @@ function checkOpenTrades(currentPriceVal, asset) {
     trades.forEach(t => {
       if(t.status !== 'pending') return;
       if(t.asset !== asset.displayName) return;
-      // Skip trades younger than 2 minutes — price hasn't moved yet
-      // (prevents same-candle instant win/loss from entry price)
-      if(_now - new Date(t.timestamp).getTime() < 2 * 60 * 1000) return;
+      // ── Young-trade skip is now TF-aware ───────────────────────────
+      // Live price shouldn't mark a brand-new trade as win/loss — the entry
+      // candle is still forming. Skip until at least half the TF's candle has
+      // elapsed (matches the dedup window in autoLogTrade).
+      //   5m  → 2.5 min   15m → 7.5 min   1H → 30 min   4H → 2 hours
+      const _liveSkipMs = TF_HALF_MS[t.timeframe] || (2 * 60 * 1000);
+      if(_now - new Date(t.timestamp).getTime() < _liveSkipMs) return;
 
       if(t.direction === 'LONG') {
         if(currentPriceVal >= +t.tp2)      { t.status='win_tp2'; t.closedAt=now; t.closedPrice=currentPriceVal; changed=true; }
@@ -8442,18 +8506,48 @@ function _tjRenderAnalytics() {
 }
 
 // ── Historical candle check (when browser was closed) ─────────
+// Verifies pending trades against historical OHLC candles fetched
+// from the exchange (Binance for crypto, Twelve Data for gold/forex).
+//
+// KEY DESIGN RULES (fixed per user feedback):
+//
+// 1. Check cadence depends on the trade's OWN timeframe — NOT on age:
+//      5m  → check every 30 min
+//      15m → check every 2 hours
+//      1H  → check every 4 hours
+//      4H  → check every 16 hours
+//    A trade younger than one full check-interval is NOT checked yet —
+//    the first candle hasn't closed.
+//
+// 2. Candle interval = the trade's timeframe.
+//    TP/SL are compared against the same TF the signal was generated on.
+//
+// 3. Candle window = [entryMs + 1 candle, now].
+//    We skip the entry candle (it was still forming when the trade opened,
+//    so its wick hitting SL would be a false loss).
+//
+// 4. Returned candles are strictly filtered to those whose OPEN time
+//    is >= startMs (defensive — Twelve Data sometimes returns older
+//    candles than requested). This is what previously caused "vhul price
+//    dekhe TP/SL mark kore dey" — pre-entry candles were being checked.
 async function _tjCheckHistorical() {
   const trades = _tjLoad();
   const _nowMs = Date.now();
-  // Only check trades older than 5 minutes — ensures at least 1 full candle has closed.
-  // Trades < 5 min are handled by live checkOpenTrades (price polling).
-  // lastHistoricalCheck cooldown: 10 min to avoid hammering API.
-  const cutoff = _nowMs - 5 * 60 * 1000;
-  const toCheck = trades.filter(t =>
-    t.status === 'pending' &&
-    new Date(t.timestamp).getTime() < cutoff &&
-    (!t.lastHistoricalCheck || _nowMs - t.lastHistoricalCheck > 10 * 60 * 1000)
-  );
+
+  // Pick the check-interval (cooldown) and candle-interval for each trade
+  // based on its OWN timeframe.
+  const toCheck = trades.filter(t => {
+    if(t.status !== 'pending') return false;
+    const entryMs       = new Date(t.timestamp).getTime();
+    const checkInterval = TF_CHECK_INTERVAL_MS[t.timeframe] || TF_CHECK_INTERVAL_MS['5m'];
+    const ageMs         = _nowMs - entryMs;
+    // (a) Must be older than one full check-interval — first candle must close
+    if(ageMs < checkInterval) return false;
+    // (b) Must not have been checked within the last check-interval
+    if(t.lastHistoricalCheck && (_nowMs - t.lastHistoricalCheck) < checkInterval) return false;
+    return true;
+  });
+
   if(!toCheck.length) return;
 
   let changed = false;
@@ -8461,45 +8555,79 @@ async function _tjCheckHistorical() {
   for(const trade of toCheck) {
     try {
       const entryMs = new Date(trade.timestamp).getTime();
-      const endMs   = Date.now();
-      const ageMs   = endMs - entryMs;
+      const endMs   = _nowMs;
 
-      // Skip entry candle: advance startMs by 1 candle-interval
-      // so the first candle checked is the one AFTER entry opened.
-      // Without this, the entry candle's wick touching SL = false loss.
-      const _intervalMs = ageMs < 2*3600000 ? 60000        // 1m = 60s
-                        : ageMs < 12*3600000 ? 5*60000      // 5m
-                        : ageMs < 7*86400000 ? 15*60000     // 15m
-                        : 3600000;                           // 1h
-      const startMs = entryMs + _intervalMs; // skip entry candle
+      // Pick candle interval from the trade's OWN timeframe.
+      // (Maps our internal TF label → Binance interval / Twelve Data interval / ms-per-candle)
+      let binInterval, tdInterval, candleMs;
+      switch(trade.timeframe) {
+        case '5m':  binInterval='5m';  tdInterval='5min';  candleMs=5  * 60 * 1000;        break;
+        case '15m': binInterval='15m'; tdInterval='15min'; candleMs=15 * 60 * 1000;        break;
+        case '1H':  binInterval='1h';  tdInterval='1h';    candleMs=60 * 60 * 1000;        break;
+        case '4H':  binInterval='4h';  tdInterval='4h';    candleMs=4  * 60 * 60 * 1000;   break;
+        case '1D':  binInterval='1d';  tdInterval='1day';  candleMs=24 * 60 * 60 * 1000;   break;
+        case '1W':  binInterval='1w';  tdInterval='1week'; candleMs=7  * 24 * 60 * 60 * 1000; break;
+        default:    binInterval='5m';  tdInterval='5min';  candleMs=5  * 60 * 1000;
+      }
 
-      const candles = await _tjFetchHistoricalCandles(trade, startMs, endMs, ageMs);
-      if(!candles || !candles.length) continue;
+      // Skip entry candle: advance by 1 full candle interval so the first
+      // candle we inspect is the one that OPENED AFTER entry.
+      // (Pre-entry candle's wick touching SL = false loss.)
+      const startMs = entryMs + candleMs;
+
+      const candles = await _tjFetchHistoricalCandles(trade, startMs, endMs, binInterval, tdInterval);
+
+      // Even if API failed (network, rate-limit), stamp lastHistoricalCheck
+      // so we don't hammer the API on the next render tick.
+      if(!candles || !candles.length) {
+        const t = trades.find(tr => tr.id === trade.id);
+        if(t) { t.lastHistoricalCheck = _nowMs; changed = true; }
+        continue;
+      }
+
+      // ── STRICT FILTER ─────────────────────────────────────────
+      // Keep only candles whose OPEN time is >= startMs.
+      // This is the fix for the "wrong price / false TP-SL" bug: previously
+      // pre-entry candles were being included in the loop and triggering
+      // false win/loss outcomes.
+      // Tolerance of 1 second handles any sub-second rounding from the API.
+      const filtered = candles.filter(c => (c[0] + 1000) >= startMs);
+      if(!filtered.length) {
+        const t = trades.find(tr => tr.id === trade.id);
+        if(t) { t.lastHistoricalCheck = _nowMs; changed = true; }
+        continue;
+      }
 
       let outcome = null, outcomeTime = null, outcomePrice = null;
 
-      // Check each candle — TP checked BEFORE SL (conservative but realistic;
-      // if both hit in same candle, assume TP hit first on profitable move,
-      // then SL. Only exception: if open already past SL — immediate loss.)
-      for(const c of candles) {
-        const openTime = c[0], high = +c[2], low = +c[3], open = +c[1];
+      // Walk candles oldest → newest. TP checked BEFORE SL within a single
+      // candle (optimistic but realistic for retail: if both touched in the
+      // same candle, the profit target was probably hit on the way up/down
+      // before the reversal hit SL). Exception: if the candle OPENED beyond
+      // SL — that's a gap, immediate loss.
+      for(const c of filtered) {
+        const openTime = c[0];
+        const open = +c[1], high = +c[2], low = +c[3];
+
         if(trade.direction === 'LONG') {
-          // If candle opened below SL — gapped down, immediate loss
-          if(open <= +trade.sl) { outcome='loss'; outcomeTime=openTime; outcomePrice=+trade.sl; break; }
-          // TP2 hit
+          // Entry was BUY. SL below entry, TPs above.
+          // Gap-down open below SL → instant loss
+          if(open <= +trade.sl)  { outcome='loss';    outcomeTime=openTime; outcomePrice=+trade.sl;  break; }
+          // TP2 (further target) hit before SL within same candle
           if(high >= +trade.tp2) { outcome='win_tp2'; outcomeTime=openTime; outcomePrice=+trade.tp2; break; }
-          // TP1 hit (price went up first)
-          if(high >= +trade.tp1) { outcome='win_tp1'; outcomeTime=openTime; outcomePrice=+trade.tp1; break; }
-          // SL hit (price only went down)
-          if(low <= +trade.sl)   { outcome='loss';    outcomeTime=openTime; outcomePrice=+trade.sl;  break; }
-        } else { // SHORT
-          // If candle opened above SL — gapped up, immediate loss
-          if(open >= +trade.sl) { outcome='loss'; outcomeTime=openTime; outcomePrice=+trade.sl; break; }
-          // TP2 hit (price went further down)
-          if(low <= +trade.tp2)  { outcome='win_tp2'; outcomeTime=openTime; outcomePrice=+trade.tp2; break; }
           // TP1 hit
-          if(low <= +trade.tp1)  { outcome='win_tp1'; outcomeTime=openTime; outcomePrice=+trade.tp1; break; }
-          // SL hit (price went up)
+          if(high >= +trade.tp1) { outcome='win_tp1'; outcomeTime=openTime; outcomePrice=+trade.tp1; break; }
+          // Only SL hit in this candle
+          if(low  <= +trade.sl)  { outcome='loss';    outcomeTime=openTime; outcomePrice=+trade.sl;  break; }
+        } else { // SHORT
+          // Entry was SELL. SL above entry, TPs below.
+          // Gap-up open above SL → instant loss
+          if(open >= +trade.sl)  { outcome='loss';    outcomeTime=openTime; outcomePrice=+trade.sl;  break; }
+          // TP2 (further down) hit
+          if(low  <= +trade.tp2) { outcome='win_tp2'; outcomeTime=openTime; outcomePrice=+trade.tp2; break; }
+          // TP1 hit
+          if(low  <= +trade.tp1) { outcome='win_tp1'; outcomeTime=openTime; outcomePrice=+trade.tp1; break; }
+          // Only SL hit
           if(high >= +trade.sl)  { outcome='loss';    outcomeTime=openTime; outcomePrice=+trade.sl;  break; }
         }
       }
@@ -8507,12 +8635,12 @@ async function _tjCheckHistorical() {
       const t = trades.find(tr => tr.id === trade.id);
       if(!t) continue;
       if(outcome) {
-        t.status          = outcome;
-        t.closedAt        = new Date(outcomeTime).toISOString();
-        t.closedPrice     = outcomePrice;
+        t.status            = outcome;
+        t.closedAt          = new Date(outcomeTime).toISOString();
+        t.closedPrice       = outcomePrice;
         t.resolvedByHistory = true;
       } else {
-        t.lastHistoricalCheck = Date.now(); // checked but still open
+        t.lastHistoricalCheck = _nowMs; // checked but still open
       }
       changed = true;
     } catch(e) { console.warn('[TJ] Historical check error:', trade.id, e); }
@@ -8521,42 +8649,62 @@ async function _tjCheckHistorical() {
   if(changed) { _tjSave(trades); _tjUpdateBadge(); if(_tjOpen) _tjRenderBody(); }
 }
 
-async function _tjFetchHistoricalCandles(trade, startMs, endMs, ageMs) {
-  // Pick interval based on trade age to minimise API calls
-  let binInterval, tdInterval;
-  if     (ageMs < 2  * 3600000)  { binInterval='1m';  tdInterval='1min';  }
-  else if(ageMs < 12 * 3600000)  { binInterval='5m';  tdInterval='5min';  }
-  else if(ageMs < 7  * 86400000) { binInterval='15m'; tdInterval='15min'; }
-  else                            { binInterval='1h';  tdInterval='1h';    }
-
+// Fetch historical OHLC candles for a trade between startMs and endMs.
+// `binInterval` / `tdInterval` are pre-resolved by the caller to match the
+// trade's OWN timeframe (NOT the trade's age).
+//
+// Returns: array of [openTimeMs, open, high, low, close, volume] sorted
+// oldest-first. Returns null on failure.
+async function _tjFetchHistoricalCandles(trade, startMs, endMs, binInterval, tdInterval) {
   if(trade.assetType === 'crypto') {
+    // Binance klines — timestamps are reliable UTC milliseconds.
+    // startTime/endTime are honored server-side.
     const sym = (trade.symbol || '').replace('/','');
     for(const base of ['https://api.binance.com','https://api.binance.us']) {
       try {
         const url = `${base}/api/v3/klines?symbol=${sym}&interval=${binInterval}&startTime=${startMs}&endTime=${endMs}&limit=1000`;
         const d = await tryFetch(url, 10000, 1);
-        if(Array.isArray(d) && d.length) return d;
+        if(Array.isArray(d) && d.length) {
+          // Binance returns: [openTime, open, high, low, close, volume, closeTime, ...]
+          // We only need [openTime, o, h, l, c, v] for our check.
+          return d.map(k => [+k[0], +k[1], +k[2], +k[3], +k[4], +k[5]]);
+        }
       } catch(_) {}
     }
-  } else {
-    // Forex / Gold — Twelve Data
-    try {
-      getTDKey && getTDKey(); // keep tracking active
-      const fmt = ms => new Date(ms).toISOString().replace('T',' ').slice(0,19);
-      const url  = `/api/td?_ep=time_series&symbol=${encodeURIComponent(trade.symbol)}&interval=${tdInterval}&start_date=${encodeURIComponent(fmt(startMs))}&outputsize=500`;
-      const data = await tryFetch(url, 10000, 1);
-      if(data && data.values && data.values.length) {
-        // Twelve Data datetime is in exchange local time (EST for Gold, UTC for crypto)
-        // We do NOT add 'Z' suffix — we only need OHLC values for TP/SL comparison.
-        // Timestamps are only used for outcome time logging, not for window filtering
-        // (the API itself handles the start_date/end_date filtering).
-        return data.values.slice().reverse().map(v => [
-          new Date(v.datetime.replace(' ','T')).getTime(), // no 'Z' — local time kept as-is
-          +v.open, +v.high, +v.low, +v.close, 0
-        ]);
-      }
-    } catch(_) {}
+    return null;
   }
+
+  // Forex / Gold — Twelve Data
+  try {
+    if(typeof getTDKey === 'function') getTDKey(); // keep tracking active
+    const fmt = ms => new Date(ms).toISOString().replace('T',' ').slice(0,19);
+    // ── CRITICAL FIX ──────────────────────────────────────────
+    // Pass BOTH start_date AND end_date so Twelve Data returns only the
+    // window we care about. Previously end_date was missing, so the API
+    // could return up to `outputsize` recent candles including pre-entry
+    // ones — that's what caused "vhul price dekhe TP/SL mark kore dey".
+    const url  = `/api/td?_ep=time_series&symbol=${encodeURIComponent(trade.symbol)}`
+               + `&interval=${tdInterval}`
+               + `&start_date=${encodeURIComponent(fmt(startMs))}`
+               + `&end_date=${encodeURIComponent(fmt(endMs))}`
+               + `&outputsize=500`;
+    const data = await tryFetch(url, 10000, 1);
+    if(data && data.values && data.values.length) {
+      // Twelve Data returns candles newest-first; reverse to oldest-first.
+      // ── CRITICAL FIX ──────────────────────────────────────────
+      // Append 'Z' so the timestamp is parsed as UTC (Twelve Data datetimes
+      // are UTC for crypto, exchange-local for forex/gold). Previously the
+      // code parsed as LOCAL browser time — for a Bangladesh user that
+      // shifted every gold candle by 6 hours, causing the entry-time
+      // filter to either drop valid candles or include invalid ones.
+      // The TP/SL OHLC values themselves are unaffected; only the
+      // timestamp ordering/filtering was wrong.
+      return data.values.slice().reverse().map(v => [
+        new Date((v.datetime || '').replace(' ','T') + 'Z').getTime(),
+        +v.open, +v.high, +v.low, +v.close, 0
+      ]);
+    }
+  } catch(_) {}
   return null;
 }
 
