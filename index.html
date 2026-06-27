@@ -1335,13 +1335,20 @@ function dailyBanTDKey(apiKey) {
   }
 }
 
-// Check if an error message indicates daily credit exhaustion
+// Check if an error message indicates daily credit exhaustion (NOT a per-minute rate limit).
+// Previously this was too broad — it matched any message containing 'plan' or 'api credit',
+// which also matched Twelve Data's per-minute rate-limit message ("Please upgrade your plan
+// if you wish to have a higher rate limit"). That caused per-minute 429s to trigger a
+// DAILY ban — wiping out keys for the rest of the day instead of waiting 60 seconds.
 function _isDailyLimitError(msg) {
   if(!msg) return false;
   const m = msg.toLowerCase();
-  return m.includes('run out of api credit') || m.includes('daily limit') ||
-         m.includes('limit being') || m.includes('credits were used') ||
-         m.includes('api credit') || m.includes('plan');
+  return m.includes('run out of api credit') ||
+         m.includes('daily limit')           ||
+         m.includes('daily api calls limit') ||
+         m.includes('credits were used')     ||
+         m.includes('out of credits');
+  // Deliberately does NOT match on 'plan' alone (per-minute 429 messages also mention plan).
 }
 
 // Wait if all keys are near their limit
@@ -1447,6 +1454,13 @@ async function tryFetch(url, timeout=10000, retries=2) {
       throw e;
     }
   }
+  // ── CRITICAL FIX: tryFetch previously returned `undefined` when all retries were
+  // exhausted on a 429 (the loop just exited without returning). Callers then got
+  // `undefined`, evaluated `d?.status === 'error'` as false, and fell through to
+  // "empty data" errors — losing the real rate-limit reason AND making the
+  // per-key ban logic in fetchTwelveKlines unreachable. Now we throw explicitly
+  // so callers can distinguish rate-limit exhaustion from genuine empty data.
+  throw new Error('Rate limit retries exhausted');
 }
 
 // ── TWELVE DATA API (uses multi-key rotation above) ────────────────
@@ -1470,11 +1484,17 @@ async function fetchTwelveKlines(twelveSymbol, interval, limit=100) {
     throw new Error('Twelve Data klines failed: ' + (d?.message || 'empty'));
   }
   if(d?.values && Array.isArray(d.values) && d.values.length > 0) {
+    // ── CRITICAL FIX: parse TD datetime as UTC (append 'Z') ─────
+    // Twelve Data datetimes look like "2024-01-01 15:30:00" and are UTC for crypto,
+    // exchange-local for forex/gold. Previously the code parsed them as local browser
+    // time — for a Bangladesh user (UTC+6) every candle was shifted 6 hours into the
+    // future. OHLC values are unaffected but any time-based comparison (freshness,
+    // boundary alignment) was wrong. Trade journal already does this fix; backporting.
     const mapped = d.values.map(v => [
-      new Date(v.datetime).getTime(),
+      new Date((v.datetime || '').replace(' ','T') + 'Z').getTime(),
       +v.open, +v.high, +v.low, +v.close,
       v.volume ? +v.volume : 0
-    ]).sort((a, b) => a[0] - b[0]); // Twelve Data returns newest-first; sort oldest-first for correct indicator math
+    ]).sort((a, b) => a[0] - b[0]); // sort oldest-first for correct indicator math
     // Safety: verify data is oldest-first (timestamp[0] < timestamp[last])
     if(mapped.length > 1 && mapped[0][0] > mapped[mapped.length-1][0]) mapped.reverse();
     return {data: mapped, source: 'twelvedata'};
@@ -2019,18 +2039,29 @@ function adx(cs, n=14) {
 }
 
 // Ichimoku Cloud — Tenkan-sen, Kijun-sen, Senkou Span A/B, Chikou Span
+// Standard Ichimoku displaces the cloud 26 periods INTO THE FUTURE — i.e. the
+// cloud visible at time T is computed from data at T-26. We must compute
+// Senkou A/B from candle data shifted 26 periods back, NOT from current data.
+// (Previously computed from current Tenkan/Kijun → effectively compared price
+// to the FUTURE cloud → false above/below-cloud signals.)
 function ichimoku(cs) {
-  if(cs.length < 52) return null;
+  if(cs.length < 78) return null; // need 52 (senkouB) + 26 (displacement)
   const donchian=(arr,period)=>{
     const sl=arr.slice(-period);
     const hi=Math.max(...sl.map(c=>c.h));
     const lo=Math.min(...sl.map(c=>c.l));
     return (hi+lo)/2;
   };
+  // Current Tenkan/Kijun (for TK cross signal)
   const tenkan=donchian(cs,9);   // Conversion line (9-period)
   const kijun=donchian(cs,26);   // Base line (26-period)
-  const senkouA=(tenkan+kijun)/2; // Leading span A (avg of tenkan/kijun, plotted 26 ahead)
-  const senkouB=donchian(cs,52);  // Leading span B (52-period, plotted 26 ahead)
+  // Cloud: compute from data shifted 26 periods BACK (so cloud at time T uses data up to T-26).
+  // This is the standard Ichimoku displacement (26 periods forward in chart terms).
+  const csShifted = cs.slice(0, Math.max(1, cs.length - 26));
+  const tenkan26  = csShifted.length >= 9  ? donchian(csShifted, 9)  : tenkan;
+  const kijun26   = csShifted.length >= 26 ? donchian(csShifted, 26) : kijun;
+  const senkouA=(tenkan26+kijun26)/2; // Leading span A (avg of tenkan/kijun at T-26)
+  const senkouB = csShifted.length >= 52 ? donchian(csShifted, 52) : donchian(cs, 52); // 52-period at T-26
   const chikou=cs[cs.length-1].c; // Lagging span (close plotted 26 back)
   const price=cs[cs.length-1].c;
   // Cloud color: bullish when senkouA > senkouB
@@ -2298,10 +2329,13 @@ function calcMFI(candles, period=14) {
       // tp === prevTP: skip — zero-change money flow is neither positive nor negative
     }
     if(totalVol === 0) return null; // No volume data — return null instead of misleading value
-    if(negFlow === 0) return {value:100, signal:'bull'}; // zero selling = pure buying pressure = bullish
+    if(negFlow === 0) return {value:100, signal:'bear'}; // MFI=100 = extreme overbought = bearish (mean-reversion)
+    if(posFlow === 0) return {value:0,   signal:'bull'}; // MFI=0   = extreme oversold    = bullish (mean-reversion)
     const mfi = 100 - (100 / (1 + posFlow / negFlow));
-    // MFI > 80 = strong buying (bullish), MFI < 20 = strong selling (bearish)
-    const signal = mfi > 80 ? 'bull' : mfi < 20 ? 'bear' : 'neutral';
+    // MFI is volume-weighted RSI — same mean-reversion interpretation as RSI:
+    // MFI > 80 = overbought (bearish reversal likely)   MFI < 20 = oversold (bullish reversal likely)
+    // (Previously used momentum interpretation which inverted the signal relative to RSI)
+    const signal = mfi > 80 ? 'bear' : mfi < 20 ? 'bull' : 'neutral';
     return {value: +mfi.toFixed(2), signal};
   } catch(_){ return null; }
 }
@@ -2350,16 +2384,19 @@ function calcSupertrend(candles, period=10, multiplier=3) {
     let directionIsBull = true; // start bullish
 
     // Start from the candle where we first have ATR (candle index = period)
+    // atrSeries[k] is the ATR computed at trs index (period-1+k), which corresponds
+    // to candle index (period+k). So at candle `si = period`, we want atrSeries[0].
     const si = period; // start candle index
     let hl2 = (candles[si].h + candles[si].l) / 2;
-    prevUpperBand = hl2 + multiplier * atrSeries[si - 1];
-    prevLowerBand = hl2 - multiplier * atrSeries[si - 1];
+    prevUpperBand = hl2 + multiplier * atrSeries[0];
+    prevLowerBand = hl2 - multiplier * atrSeries[0];
     directionIsBull = candles[si].c > prevLowerBand;
 
-    // Walk forward
+    // Walk forward. At candle index i (i > si), the corresponding ATR index in
+    // atrSeries is (i - period). atrSeries.length = trs.length - period + 1 = candles.length - period,
+    // so atrIdx ranges from 1 to candles.length - period - 1 (always valid in this loop).
     for(let i = si + 1; i < candles.length; i++){
-      const atrIdx = i - 1;
-      if(atrIdx >= atrSeries.length) break;
+      const atrIdx = i - period;
       hl2 = (candles[i].h + candles[i].l) / 2;
 
       let newUpperBand = hl2 + multiplier * atrSeries[atrIdx];
@@ -2389,6 +2426,13 @@ function calcSupertrend(candles, period=10, multiplier=3) {
     }
 
     const supertrendVal = directionIsBull ? prevLowerBand : prevUpperBand;
+    // Guard: if ATR series was too short to fully walk the loop (e.g. only
+    // period+2..2*period-1 candles supplied), prevUpperBand/LowerBand can be
+    // uninitialized (NaN). Returning a 'bull' default would inject a stale
+    // bullish vote into analyzeTF — return null instead.
+    if(!isFinite(prevUpperBand) || !isFinite(prevLowerBand) || !isFinite(supertrendVal)) {
+      return null;
+    }
     const signal = directionIsBull ? 'bull' : 'bear';
     return {supertrend: +supertrendVal.toFixed(8), direction: directionIsBull ? 'bull' : 'bear', signal};
   } catch(_){ return null; }
@@ -2679,11 +2723,15 @@ function analyzeTF(rawData, price, assetType) {
   // %K/%D crossover only meaningful in extreme zones — mid-range crossovers are noise
   if(stK!=null && stD!=null && (stK<30 || stK>70)){ add3(stK>stD?'bull':'bear', 1); }
   if(vw && vw>0){ const rel=Math.abs(price-vw)/vw; if(rel<nearPct){/* neutral */} else add3(price>vw?'bull':'bear'); }
-  if(mc) add3(mc.positive?'bull':'bear');
   if(mc && mc.histogram && mc.histogram.length>=2){
+    // MACD has both a real signal line (sigLine.length>=2) AND a histogram we can trend-check.
+    add3(mc.positive?'bull':'bear');
     const h=mc.histogram;
     add3(h[h.length-1]>h[h.length-2]?'bull':'bear', 1);
   }
+  // (Note: when mc exists but histogram.length<2, MACD is still in warmup — signal
+  // line is just the seed value, so positive/negative is unreliable. Skip the
+  // directional vote entirely rather than biasing bearish with an unsmoothed signal.)
   // Short-term momentum (last 5 candles) — low weight, noisy on higher TFs
   const l5=closes.slice(-5); add3(l5[l5.length-1]>l5[0]?'bull':'bear', 0.3);
 
@@ -4693,7 +4741,14 @@ function calcCrossAssetCorrelations(currentCloses, assetCloses) {
   const results = [];
   if(!currentCloses || currentCloses.length < 10) return results;
 
+  // Defensive filter: skip the current asset's own entry in the cache (can happen
+  // after an asset switch when cache was built for the previous current asset and
+  // now includes the new current asset's data). Without this, the panel showed
+  // "ETH vs ETH: Strong Positive (r=1.00)" after switching from BTC to ETH.
+  const currentSymbol = (typeof currentAsset !== 'undefined' && currentAsset?.symbol) || null;
+
   for(const [name, data] of Object.entries(assetCloses)) {
+    if (currentSymbol && data.symbol === currentSymbol) continue;
     const corr = calcPearsonCorrelation(currentCloses, data.closes);
     if(corr !== null) {
       results.push({
@@ -7916,6 +7971,11 @@ async function runAnalysis() {
           if(klineResults) TIMEFRAMES.forEach((tf,i) => { if(klineResults[i]?.data) _klinesForLog[tf.label]=klineResults[i].data; });
           const _bestR = results[bestTF];
           const _sig = _bestR?.signal || 'neutral';
+          // Stash bestTF result so calcGateFilter can use the SAME TP/SL values
+          // that will be stored in the trade journal (regime-adaptive multipliers).
+          // Without this, gate filter computes its own TP/SL with hardcoded 1.5/3.0/1.0
+          // multipliers, displaying different numbers than what actually gets logged.
+          if(_bestR) results._bestTFResult = _bestR;
           _gateResultForLog = calcGateFilter(results, _sig, currentPrice, _klinesForLog, currentAsset.type);
         } catch(_) {}
       }
@@ -8150,6 +8210,8 @@ function hsBuildFromCache() {
     const TRADEABLE_TFS = ['5m','15m','1H','4H'];
     for(const [tfLabel, r] of Object.entries(cached.results)) {
       if(!r || r.signal === 'neutral') continue;
+      // Only scan tradeable TFs (skip 1D/1W which are slow HTF bias, not actionable signals)
+      if(!TRADEABLE_TFS.includes(tfLabel)) continue;
       if(r.prob >= 60) {
         signals.push({
           asset: asset.displayName,
@@ -8196,9 +8258,14 @@ let sessPanelOpen = false;
 let sessClockTimer = null;
 
 // ── Session & Kill Zone Definitions (BDT = UTC+6) ─────────────
+// London FX session opens 07:00 GMT (UTC) = 13:00 BDT, closes 16:00 GMT = 22:00 BDT.
+// (Previous code used start:840 = 14:00 BDT = 08:00 UTC, which was 1 hour late —
+//  even in winter. Now corrected to start:780 = 13:00 BDT = 07:00 UTC.)
+// Note: DST shifts (BST in summer = UTC+1) are NOT yet handled — London actually
+// opens 12:00 BDT in summer. TODO: add DST detection.
 const SESS_SESSIONS = [
   { id:'asia',    name:'Asia Session',       icon:'🌏', color:'#f59e0b', start:360,  end:900,   priority:1 },
-  { id:'london',  name:'London Session',     icon:'🇬🇧', color:'#3b82f6', start:840,  end:1380,  priority:2 },
+  { id:'london',  name:'London Session',     icon:'🇬🇧', color:'#3b82f6', start:780,  end:1320,  priority:2 },
   { id:'overlap', name:'London+NY Overlap',  icon:'⭐', color:'#ec4899', start:1140, end:1380,  priority:4 },
   { id:'ny',      name:'New York Session',   icon:'🗽', color:'#10b981', start:1140, end:1440+240, priority:3 }, // crosses midnight
   { id:'quiet',   name:'Market Quiet',       icon:'💤', color:'#4a5278', start:240,  end:360,   priority:0 },
@@ -8215,7 +8282,7 @@ const SESS_ASSETS = {
 const SESS_KILLZONES = [
   { id:'ny_kz',     name:'NY Kill Zone',       color:'#10b981', start:1170, end:1260, sessionId:'ny',      priority:1 },
   { id:'london_close',name:'London Close',     color:'#ec4899', start:1260, end:1380, sessionId:'overlap', priority:2 },
-  { id:'london_kz', name:'London Kill Zone',   color:'#3b82f6', start:840,  end:960,  sessionId:'london',  priority:3 },
+  { id:'london_kz', name:'London Kill Zone',   color:'#3b82f6', start:780,  end:900,  sessionId:'london',  priority:3 },
   { id:'asia_kz',   name:'Asia Kill Zone',     color:'#f59e0b', start:360,  end:540,  sessionId:'asia',    priority:4 },
   { id:'overlap_kz',name:'Overlap Window',     color:'#ec4899', start:1140, end:1380, sessionId:'overlap', priority:5 },
 ];
@@ -8801,7 +8868,7 @@ function autoLogTrade(results, bestTF, price, masterScoreVal, asset, gateResult)
       date: now.toISOString().split('T')[0],
       dayName: dayNames[now.getDay()],
       dayIndex: now.getDay(),
-      hour: now.getHours(),
+      hour: now.getUTCHours(), // UTC hour matches the "Time Block (UTC)" label in analytics
       status: 'pending', // pending | win_tp1 | win_tp2 | loss
       closedAt: null,
       closedPrice: null,
@@ -8889,7 +8956,7 @@ function _tjRenderTrades() {
     <div style="text-align:center;padding:50px 20px;color:var(--muted)">
       <div style="font-size:36px;margin-bottom:12px">📋</div>
       <div style="font-weight:600;color:var(--text);margin-bottom:6px">এখনো কোনো trade log হয়নি</div>
-      <div style="font-size:12px">Confidence ≥ 70% হলে analysis এর পর<br>automatically save হবে।</div>
+      <div style="font-size:12px">Confidence ≥ 65% হলে analysis এর পর<br>automatically save হবে।</div>
     </div>`;
 
   const SL = { pending:'⏳ Pending', win_tp1:'✅ TP1 Hit', win_tp2:'✅✅ TP2 Hit', loss:'❌ SL Hit' };
@@ -9408,8 +9475,10 @@ function _gateHTFBias(results) {
 }
 
 function _gateVolSpike(candles) {
-  /* Returns { spike:bool, ratio:number } from last 20 candles */
-  if (!candles || candles.length < 20) return { spike:false, ratio:1 };
+  /* Returns { spike:bool, ratio:number, hasVol:bool } from last 20 candles.
+   * For forex/gold (Twelve Data) volume is always 0 — caller should detect
+   * hasVol===false and render the gate as N/A instead of fail. */
+  if (!candles || candles.length < 20) return { spike:false, ratio:0, hasVol:false };
   // candles are raw kline arrays: [time,open,high,low,close,volume,...]
   const parseVol = c => {
     if (Array.isArray(c)) return +c[5] || 0;
@@ -9418,7 +9487,9 @@ function _gateVolSpike(candles) {
   const vols  = candles.slice(-20).map(parseVol);
   const avg   = vols.slice(0, -1).reduce((a,b) => a+b, 0) / 19;
   const cur   = vols[vols.length - 1];
-  return { spike: avg > 0 && cur > avg * 1.5, ratio: avg > 0 ? cur / avg : 1 };
+  // Return ratio:0 (not 1) when there's no real volume — caller can detect N/A.
+  if (avg <= 0) return { spike:false, ratio:0, hasVol:false };
+  return { spike: cur > avg * 1.5, ratio: cur / avg, hasVol:true };
 }
 
 function _gateADXTrending(tfResult) {
@@ -9488,7 +9559,11 @@ function calcGateFilter(results, signal, price, rawKlines, assetType) {
   let g3Pass = false, g3Warn = false, g3Detail = 'N/A';
   if (macdObj) {
     const positive   = macdObj.positive   ?? (macdObj.val  > (macdObj.signal || 0));
-    const histRising = macdObj.histRising  ?? false;
+    // Compute histRising from the histogram array (macd() returns it as `histogram`).
+    // Previously used `macdObj.histRising ?? false` but macd() never sets that field,
+    // so the WARN branch was dead code and produced asymmetric/inverted behavior.
+    const h = macdObj.histogram;
+    const histRising = (h && h.length >= 2) ? h[h.length-1] > h[h.length-2] : false;
     if (signal === 'bull') {
       g3Pass = positive;
       g3Warn = !positive && histRising; // recovering — histogram turning up
@@ -9507,28 +9582,55 @@ function calcGateFilter(results, signal, price, rawKlines, assetType) {
   // ── GATE 4: Volume Confirmation ──────────────────────────
   // In a ranging market (ADX < 25) breakouts need volume confirmation.
   // In trending markets volume spike is a bonus but not required.
+  // For forex/gold (Twelve Data) volume is always 0 — gate is treated as N/A
+  // (warn, not fail) so these assets can still reach high-conviction verdicts.
   const klines1H = rawKlines?.['1H'] || rawKlines?.['15m'] || null;
   const volD    = _gateVolSpike(klines1H);
   const trending = _gateADXTrending(h4 || h1);
   let g4Pass = true, g4Warn = false;
-  let g4Detail = volD.ratio > 0
-    ? `${volD.spike ? '⚡ Spike' : 'Normal'} (${volD.ratio.toFixed(1)}x avg)`
-    : 'Volume data N/A';
-  if (!trending) {
-    // Ranging market — require spike for breakout trade
-    g4Pass = volD.spike;
-    g4Warn = !volD.spike;
-    if (!volD.spike) g4Detail += ' — spike needed (ranging mkt)';
+  let g4Detail;
+  if (!volD.hasVol) {
+    // No real volume data (gold/forex) — gate is informational only.
+    g4Pass = true;
+    g4Warn = true;
+    g4Detail = 'Volume data N/A — gate skipped (caution)';
+  } else {
+    g4Detail = `${volD.spike ? '⚡ Spike' : 'Normal'} (${volD.ratio.toFixed(1)}x avg)`;
+    if (!trending) {
+      // Ranging market — require spike for breakout trade
+      g4Pass = volD.spike;
+      g4Warn = !volD.spike;
+      if (!volD.spike) g4Detail += ' — spike needed (ranging mkt)';
+    }
   }
 
   // ── GATE 5: Risk:Reward ≥ 1:1.5 ────────────────────────
-  const atrVal = h1?.atr || h4?.atr || price * 0.015;
-  const tp1 = signal === 'bull' ? price + atrVal * 1.5 : price - atrVal * 1.5;
-  const sl  = signal === 'bull' ? price - atrVal       : price + atrVal;
-  const rr  = Math.abs(tp1 - price) / (Math.abs(sl - price) || 1);
-  const tp2 = signal === 'bull' ? price + atrVal * 3   : price - atrVal * 3;
-  const g5Pass = rr >= 1.4;
-  const g5Detail = `R:R = 1:${rr.toFixed(2)}${rr < 1.4 ? ' (min 1:1.5 needed)' : ' ✓'}`;
+  // CRITICAL FIX: previously computed TP/SL here with hardcoded multipliers
+  // (1.5/3.0/1.0) which always produced rr=1.5 → gate was a no-op.
+  // Now reuse the ACTUAL tp1/tp2/sl that analyzeTF() computed for bestTF —
+  // these are the values that will be stored in the trade journal, so the
+  // displayed R:R matches what the user actually trades.
+  // bestTF result is passed via results[signal_bestTF] — caller ensures the
+  // active bestTF result is keyed under '_bestTF' (see _triggerGateRender / autoLogTrade).
+  const bestR    = results._bestTFResult || null;
+  const atrVal   = +h1?.atr || +h4?.atr || price * 0.015; // numeric coercion (atr may be string)
+  let tp1, tp2, sl, rr;
+  if (bestR && bestR.tp1 != null && bestR.sl != null) {
+    tp1 = +bestR.tp1;
+    tp2 = +bestR.tp2;
+    sl  = +bestR.sl;
+    const slDist = Math.abs(sl - price);
+    rr  = slDist > 0 ? Math.abs(tp1 - price) / slDist : 0;
+  } else {
+    // Fallback (no bestTF result available) — use ATR-based estimate
+    tp1 = signal === 'bull' ? price + atrVal * 1.5 : price - atrVal * 1.5;
+    tp2 = signal === 'bull' ? price + atrVal * 3.0 : price - atrVal * 3.0;
+    sl  = signal === 'bull' ? price - atrVal       : price + atrVal;
+    rr  = Math.abs(tp1 - price) / (Math.abs(sl - price) || 1);
+  }
+  // Threshold matches the gate NAME (1:1.5). Previously checked 1.4 — mismatch.
+  const g5Pass = rr >= 1.5;
+  const g5Detail = `R:R = 1:${rr.toFixed(2)}${rr < 1.5 ? ' (min 1:1.5 needed)' : ' ✓'}`;
 
   // ── Build gate objects ───────────────────────────────────
   const gates = [
@@ -9540,17 +9642,25 @@ function calcGateFilter(results, signal, price, rawKlines, assetType) {
   ];
 
   const strictPassed = [g1Pass, g2Pass, g3Pass, g4Pass, g5Pass].filter(Boolean).length;
-  const softPassed   = [g1Pass||g1Warn, g2Pass, g3Pass||g3Warn, g4Pass, g5Pass].filter(Boolean).length;
+  const softPassed   = [g1Pass||g1Warn, g2Pass, g3Pass||g3Warn, g4Pass||g4Warn, g5Pass].filter(Boolean).length;
+  // Count warns separately so the verdict can distinguish:
+  //   5 PASS            → HIGH CONVICTION
+  //   4 PASS + 1 WARN   → HIGH CONVICTION (warn is a caution, not a fail)
+  //   3 PASS + 2 WARN   → MODERATE
+  //   ≤2 PASS           → WEAK / NO TRADE
+  // Previously the verdict collapsed WARN into FAIL — a 3 PASS + 2 WARN setup
+  // was labeled "WEAK" instead of "MODERATE", causing users to skip valid setups.
+  const warnCount = [g1Warn, g3Warn, g4Warn].filter(Boolean).length;
 
-  return _buildGateResult(gates, strictPassed, softPassed, { tp1, tp2, sl, rr, atr:atrVal }, signal, price, assetType);
+  return _buildGateResult(gates, strictPassed, softPassed, { tp1, tp2, sl, rr, atr:atrVal }, signal, price, assetType, warnCount);
 }
 
 function _g(icon, name, cls, status, detail) {
   return { icon, name, cls, status, detail };
 }
 
-function _buildGateResult(gates, strictPassed, softPassed, trade, signal, price, assetType) {
-  return { gates, strictPassed, softPassed, trade, signal, price, assetType };
+function _buildGateResult(gates, strictPassed, softPassed, trade, signal, price, assetType, warnCount=0) {
+  return { gates, strictPassed, softPassed, warnCount, trade, signal, price, assetType };
 }
 
 // ── Render Gate Panel ─────────────────────────────────────────
@@ -9591,9 +9701,13 @@ function renderGateFilter(gateResult) {
   const verdict = document.getElementById('gateVerdict');
   if (verdict) {
     const sp = gateResult.strictPassed;
+    const wp = gateResult.softPassed;   // pass + warn counted as soft-pass
     const t  = gateResult.trade;
     const dir = gateResult.signal === 'bull' ? 'LONG 🚀' : gateResult.signal === 'bear' ? 'SHORT 🔻' : '—';
 
+    // Verdict logic: WARN is a caution, not a fail. A setup with 5 PASS or
+    // 4 PASS + 1 WARN is still high-conviction. 3 PASS + ≤2 WARN is moderate.
+    // Only hard fails reduce conviction.
     let cls = '', txt = '';
     if (gateResult.signal === 'neutral' || !gateResult.signal) {
       cls = 'gate-verdict-notrade';
@@ -9601,10 +9715,19 @@ function renderGateFilter(gateResult) {
     } else if (sp >= 5) {
       cls = 'gate-verdict-trade';
       txt = `🚀 HIGH CONVICTION ${dir} — সব ৫টি গেট পাস! R:R = 1:${t?.rr?.toFixed(2)||'—'}। Trade নেওয়া যেতে পারে।`;
+    } else if (sp === 4 && wp >= 5) {
+      // 4 hard pass + 1 warn — still high conviction (warn is a caution)
+      cls = 'gate-verdict-trade';
+      const warned = gateResult.gates.find(g => g.cls === 'warn');
+      txt = `🚀 HIGH CONVICTION ${dir} — 4 গেট পাস + 1 সতর্কতা (${warned?.name||''})। R:R = 1:${t?.rr?.toFixed(2)||'—'}।`;
     } else if (sp === 4) {
       const failed = gateResult.gates.find(g => g.cls === 'fail');
       cls = 'gate-verdict-wait';
       txt = `⚠️ MODERATE (4/5 গেট পাস) — "${failed?.name || 'একটি গেট'}" fail। Confirmation এর অপেক্ষা করো।`;
+    } else if (sp === 3 && wp >= 4) {
+      // 3 pass + 1-2 warn — moderate
+      cls = 'gate-verdict-wait';
+      txt = `⚠️ MODERATE (${sp}/5 পাস + ${wp-sp} সতর্কতা) — Setup দেখো কিন্তু position size কমাও।`;
     } else if (sp === 3) {
       cls = 'gate-verdict-wait';
       txt = `⚠️ WEAK SETUP (${sp}/5 গেট পাস) — Setup এখনো পরিপক্ক না। Wait করো।`;
@@ -9617,7 +9740,7 @@ function renderGateFilter(gateResult) {
     verdict.innerHTML = `<span>${txt}</span>`;
 
     // Trade details if high conviction
-    if (sp >= 4 && t && gateResult.price) {
+    if ((sp >= 5 || (sp === 4 && wp >= 5)) && t && gateResult.price) {
       const fmtP = v => Number(v) > 1000
         ? Number(v).toLocaleString('en-US', {maximumFractionDigits:0})
         : Number(v).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:4});
@@ -9665,18 +9788,24 @@ function _triggerGateRender() {
 
     if (!results || !price) return;
 
-    // Determine dominant signal from TF results (same logic as renderGauge)
-    let tb = 0, tr = 0, tw = 0;
-    const TF_WEIGHTS = { '5m':0.5,'15m':0.8,'1H':1.0,'4H':1.4,'1D':1.8,'1W':2.0 };
-    for (const [label, r] of Object.entries(results)) {
-      const w = TF_WEIGHTS[label] || 1;
-      if (!r) continue;
-      tb += (r.bullPct || 0) * w;
-      tr += (r.bearPct || 0) * w;
-      tw += w;
-    }
-    const avgBull = tw > 0 ? tb / tw : 50;
-    const signal  = avgBull >= 60 ? 'bull' : avgBull <= 40 ? 'bear' : 'neutral';
+    // ── Unify signal source with autoLogTrade ───────────────────
+    // Previously this function computed its OWN weighted-average signal using
+    // a different TF weight set ({5m:0.5,15m:0.8,1H:1.0,4H:1.4,1D:1.8,1W:2.0})
+    // than renderGauge (which uses TIMEFRAMES weights {1,2,3,4,5,6}). The two
+    // could disagree — gauge needle bullish, gate panel neutral — confusing the user.
+    //
+    // Now we use the SAME signal definition as autoLogTrade: results[bestTF].signal.
+    // This guarantees: if autoLogTrade logs a LONG trade, the gate panel will show
+    // LONG too (with matching TP/SL values, since we also pass bestTF result through).
+    const bestTFLabel = typeof dashboardCache !== 'undefined' && currentAsset?.symbol
+                       ? dashboardCache[currentAsset.symbol]?.bestTF
+                       : null;
+    const bestR  = bestTFLabel ? results[bestTFLabel] : null;
+    const signal = bestR?.signal || 'neutral';
+
+    // Stash the bestTF result so calcGateFilter can reuse its TP/SL values
+    // (matches what autoLogTrade will store in the journal).
+    if (bestR) results._bestTFResult = bestR;
 
     // Get raw klines from cache — klineResults is an array indexed by TIMEFRAMES order
     // Build a label-keyed map for gate functions
