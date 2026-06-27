@@ -10666,12 +10666,18 @@ async function _tjCheckHistorical() {
       }
 
       // ── STRICT FILTER ─────────────────────────────────────────
-      // Keep only candles whose OPEN time is >= startMs.
+      // Keep only candles whose OPEN time is strictly >= startMs.
       // This is the fix for the "wrong price / false TP-SL" bug: previously
       // pre-entry candles were being included in the loop and triggering
       // false win/loss outcomes.
-      // Tolerance of 1 second handles any sub-second rounding from the API.
-      const filtered = candles.filter(c => (c[0] + 1000) >= startMs);
+      //
+      // CRITICAL FIX (user reported 'imagine data vaiba sl hit dekhacche'):
+      // Old code had +1000ms tolerance which could let the ENTRY CANDLE
+      // itself slip through if there's any timestamp rounding between
+      // Binance/TD and our entry timestamp. The entry candle's wick
+      // touching SL during normal price movement = FALSE SL HIT.
+      // Now using 0 tolerance — candle openTime must be strictly >= startMs.
+      const filtered = candles.filter(c => c[0] >= startMs);
       if(!filtered.length) {
         const t = trades.find(tr => tr.id === trade.id);
         if(t) { t.lastHistoricalCheck = _nowMs; changed = true; }
