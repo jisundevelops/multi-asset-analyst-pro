@@ -6,6 +6,10 @@
       "use": "@vercel/node"
     },
     {
+      "src": "api/macro.js",
+      "use": "@vercel/node"
+    },
+    {
       "src": "index.html",
       "use": "@vercel/static"
     }
@@ -14,6 +18,10 @@
     {
       "src": "/api/td",
       "dest": "/api/td.js"
+    },
+    {
+      "src": "/api/macro",
+      "dest": "/api/macro.js"
     },
     {
       "src": "/(.*)",

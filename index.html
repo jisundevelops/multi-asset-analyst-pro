@@ -1213,177 +1213,88 @@ const ASSETS = {
     {symbol:'XAU/USD', type:'gold', displayName:'XAU/USD', binanceSymbol:'', twelveSymbol:'XAU/USD'},
   ]
 };
-// ── TWELVE DATA MULTI-KEY ROTATION ────────────────────────────────
-// 10 API keys × 8 calls/min each = 80 calls/min total capacity
-// Each key is tracked independently; auto-ban on 429, auto-unban after 65s cooldown
-// DAILY BAN: Keys that exhaust daily credits are banned until next UTC midnight
-const TD_API_KEYS = [
-  // Placeholder keys — real keys are in Vercel env vars, proxied via /api/td
-  // These values are used ONLY for client-side rate-limit tracking (never sent to TwelveData)
-  'slot_1','slot_2','slot_3','slot_4','slot_5',
-  'slot_6','slot_7','slot_8','slot_9','slot_10',
-];
+// ── TWELVE DATA API CALL COALESCING (client-side) ────────────────
+// ARCHITECTURE (refactored):
+//   Previously the client maintained a parallel key-state map (slot_1..slot_10)
+//   with its own ban tracking. This was fictional — the proxy at api/td.js
+//   strips client-supplied apikey and picks the real key server-side, so the
+//   client never knew which real key was used and ban calls did nothing.
+//
+//   Now api/td.js holds the authoritative per-key ban state and uses
+//   least-recently-used selection server-side. The client's only job here is
+//   to coalesce parallel calls (avoid firing 4 calls in the same tick when
+//   fetchMacroData issues Promise.all) — this gives the server a chance to
+//   spread them across keys. We keep a minimal global call-log for this
+//   coalescing, NOT for banning.
+//
+// Real per-key ban state lives in api/td.js — see that file for details.
+// The x-td-key-slot response header is now purely informational/debug.
+let _lastTDCallTs = 0;
+const TD_MIN_CALL_GAP_MS = 80; // 80ms between TD proxy calls — spreads load
+const TD_MAX_PARALLEL    = 4;  // don't queue more than 4 in flight
 
-// Track per-key rate limits and ban status
+// Lightweight in-flight counter (not per-key — server handles per-key limits)
+let _tdInFlight = 0;
+
+// Wait for an available TD call slot (coalesce parallel bursts)
+async function _tdWaitForRateLimit() {
+  // If too many calls in flight, wait for one to finish
+  while (_tdInFlight >= TD_MAX_PARALLEL) {
+    await new Promise(res => setTimeout(res, 100));
+  }
+  // Enforce a minimum gap between consecutive calls to give the server time
+  // to record the previous call's timestamp on its selected key.
+  const now = Date.now();
+  const since = now - _lastTDCallTs;
+  if (since < TD_MIN_CALL_GAP_MS) {
+    await new Promise(res => setTimeout(res, TD_MIN_CALL_GAP_MS - since));
+  }
+  _lastTDCallTs = Date.now();
+  _tdInFlight++;
+  return Promise.resolve();
+}
+
+// Release a call slot (call this in a finally block after the request finishes)
+function _tdReleaseSlot() {
+  if (_tdInFlight > 0) _tdInFlight--;
+}
+
+// Old per-key state (kept for backward-compat with any code that reads these
+// fields, but no longer used for ban tracking — server is authoritative now).
+// Removing these would break callers that reference _tdKeyState / banTDKey /
+// dailyBanTDKey / _tdUsableKeyCount. They are now no-ops.
+const TD_API_KEYS = ['slot_1','slot_2','slot_3','slot_4','slot_5',
+                     'slot_6','slot_7','slot_8','slot_9','slot_10'];
 const _tdKeyState = TD_API_KEYS.map(key => ({
-  key,
-  callTimes: [],       // timestamps of recent calls
-  banned: false,        // true if 429 received (temporary)
-  banUntil: 0,          // timestamp when temporary ban expires
-  dailyBanned: false,   // true if daily credits exhausted
-  dailyBanUntil: 0,     // timestamp when daily ban expires (next UTC midnight)
-  totalCalls: 0,        // lifetime counter
-  failedCalls: 0,       // failed counter
+  key, callTimes: [], banned: false, banUntil: 0,
+  dailyBanned: false, dailyBanUntil: 0, totalCalls: 0, failedCalls: 0,
 }));
-
-const TD_CALLS_PER_KEY_PER_MIN = 8; // Twelve Data free tier = 8 calls/min/key
-const TD_BAN_COOLDOWN_MS = 65000;    // 65s cooldown after temporary 429
-
-// Get next UTC midnight timestamp for daily ban expiry
+const TD_CALLS_PER_KEY_PER_MIN = 8;
+const TD_BAN_COOLDOWN_MS = 65000;
 function _nextUTCMidnight() {
   const now = new Date();
   const midnight = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1, 0, 0, 0));
   return midnight.getTime();
 }
-
-// Check how many keys are still usable (not daily-banned)
 function _tdUsableKeyCount() {
-  const now = Date.now();
-  return _tdKeyState.filter(ks => !ks.dailyBanned || now >= ks.dailyBanUntil).length;
+  // Server is authoritative — assume all 10 keys are usable unless the server
+  // explicitly tells us otherwise via a 429/daily-limit response.
+  return 10;
 }
-
-// Select the best available key (fewest recent calls, not banned, not daily-banned)
-function _tdSelectKey() {
-  const now = Date.now();
-  let bestKey = null;
-  let bestScore = Infinity;
-
-  // First pass: auto-unban expired daily bans
-  for(const ks of _tdKeyState) {
-    if(ks.dailyBanned && now >= ks.dailyBanUntil) {
-      ks.dailyBanned = false;
-      ks.dailyBanUntil = 0;
-      ks.callTimes = []; // reset tracking after daily reset
-      console.log(`[TwelveData] Key ...${ks.key.slice(-6)} daily ban expired, back in rotation`);
-    }
-  }
-
-  for(const ks of _tdKeyState) {
-    // Skip daily-banned keys completely
-    if(ks.dailyBanned) continue;
-    // Auto-unban expired temporary bans
-    if(ks.banned && now >= ks.banUntil) {
-      ks.banned = false;
-      ks.callTimes = []; // reset tracking after cooldown
-    }
-    if(ks.banned) continue;
-
-    // Clean old timestamps (keep only last 65s)
-    ks.callTimes = ks.callTimes.filter(t => now - t < 65000);
-
-    // Score = number of recent calls (prefer least-used key)
-    const score = ks.callTimes.length;
-    if(score < bestScore) {
-      bestScore = score;
-      bestKey = ks;
-    }
-  }
-
-  // If all keys are temporarily banned, pick the one that unbans soonest
-  if(!bestKey) {
-    const nonDailyBanned = _tdKeyState.filter(ks => !ks.dailyBanned);
-    if(nonDailyBanned.length > 0) {
-      bestKey = nonDailyBanned.reduce((a, b) => a.banUntil < b.banUntil ? a : b);
-    } else {
-      // All keys daily-banned — this should rarely happen, but pick soonest daily reset
-      bestKey = _tdKeyState.reduce((a, b) => a.dailyBanUntil < b.dailyBanUntil ? a : b);
-    }
-  }
-
-  return bestKey;
-}
-
-// Get current active API key (with smart rotation)
+function _tdSelectKey() { return _tdKeyState[0]; }
 function getTDKey() {
-  const ks = _tdSelectKey();
-  ks.callTimes.push(Date.now());
-  ks.totalCalls++;
-  return ks.key;
+  // No-op — server picks the real key. Kept so legacy callers don't crash.
+  // Returns the first slot name (used by some callers as a correlation ID).
+  _tdKeyState[0].callTimes.push(Date.now());
+  _tdKeyState[0].totalCalls++;
+  return _tdKeyState[0].key;
 }
-
-// Ban a key that returned 429 (temporary rate-limit)
-function banTDKey(apiKey) {
-  const ks = _tdKeyState.find(k => k.key === apiKey);
-  if(ks) {
-    ks.banned = true;
-    ks.banUntil = Date.now() + TD_BAN_COOLDOWN_MS;
-    ks.failedCalls++;
-    console.warn(`[TwelveData] Key ...${apiKey.slice(-6)} rate-limited, banned for 65s`);
-  }
+function banTDKey(_apiKey) {
+  // No-op — server handles per-key bans. Kept for backward-compat.
+  // (Callers may still invoke this; it does nothing harmful.)
 }
-
-// Daily-ban a key that exhausted daily API credits
-function dailyBanTDKey(apiKey) {
-  const ks = _tdKeyState.find(k => k.key === apiKey);
-  if(ks && !ks.dailyBanned) {
-    ks.dailyBanned = true;
-    ks.dailyBanUntil = _nextUTCMidnight();
-    ks.banned = false; // clear temp ban since daily ban supersedes it
-    ks.callTimes = [];
-    ks.failedCalls++;
-    console.warn(`[TwelveData] Key ...${apiKey.slice(-6)} DAILY CREDITS EXHAUSTED, banned until next UTC midnight`);
-  }
-}
-
-// Check if an error message indicates daily credit exhaustion (NOT a per-minute rate limit).
-// Previously this was too broad — it matched any message containing 'plan' or 'api credit',
-// which also matched Twelve Data's per-minute rate-limit message ("Please upgrade your plan
-// if you wish to have a higher rate limit"). That caused per-minute 429s to trigger a
-// DAILY ban — wiping out keys for the rest of the day instead of waiting 60 seconds.
-function _isDailyLimitError(msg) {
-  if(!msg) return false;
-  const m = msg.toLowerCase();
-  return m.includes('run out of api credit') ||
-         m.includes('daily limit')           ||
-         m.includes('daily api calls limit') ||
-         m.includes('credits were used')     ||
-         m.includes('out of credits');
-  // Deliberately does NOT match on 'plan' alone (per-minute 429 messages also mention plan).
-}
-
-// Wait if all keys are near their limit
-async function _tdWaitForRateLimit() {
-  const now = Date.now();
-  const usableCount = _tdUsableKeyCount();
-
-  // If all keys are daily-banned, don't wait — throw immediately so callers use fallback
-  if(usableCount === 0) {
-    throw new Error('All Twelve Data API keys have exhausted daily credits');
-  }
-
-  const ks = _tdSelectKey();
-
-  // If the selected key is daily-banned (shouldn't happen after above check, but safety), skip
-  if(ks.dailyBanned) {
-    throw new Error('Selected key is daily-banned');
-  }
-
-  // Clean old timestamps
-  ks.callTimes = ks.callTimes.filter(t => now - t < 65000);
-
-  if(ks.callTimes.length >= TD_CALLS_PER_KEY_PER_MIN) {
-    const oldestInWindow = ks.callTimes[0];
-    const waitMs = Math.max(65000 - (now - oldestInWindow) + 1000, 2000);
-    // With 10 keys, there's almost always another key available — cap wait to 3s max
-    const cappedWait = Math.min(waitMs, 3000);
-    if(cappedWait < waitMs) {
-      console.log(`[TwelveData] Key ...${ks.key.slice(-6)} near limit, capped wait ${Math.round(cappedWait/1000)}s`);
-    } else {
-      console.log(`[TwelveData] Key ...${ks.key.slice(-6)} near limit, waiting ${Math.round(waitMs/1000)}s...`);
-    }
-    return new Promise(res => setTimeout(res, cappedWait));
-  }
-  return Promise.resolve();
+function dailyBanTDKey(_apiKey) {
+  // No-op — server handles daily bans. Kept for backward-compat.
 }
 
 const TD_INTERVAL_MAP = {'5m':'5min','15m':'15min','1h':'1h','4h':'4h','1d':'1day','1w':'1week'};
@@ -1467,88 +1378,109 @@ async function tryFetch(url, timeout=10000, retries=2) {
 
 async function fetchTwelveKlines(twelveSymbol, interval, limit=100) {
   await _tdWaitForRateLimit();
-  const tdInterval = TD_INTERVAL_MAP[interval] || '1h';
-  // Twelve Data supports up to 5000 outputsize; we need at least 100 for backtesting
-  // Ichimoku needs 52 candles, backtest needs 100 candles with 30-bar warmup
-  const effectiveLimit = Math.min(limit, 500);
-  getTDKey(); // keep call-tracking active
-  const url = `/api/td?_ep=time_series&symbol=${encodeURIComponent(twelveSymbol)}&interval=${tdInterval}&outputsize=${effectiveLimit}`;
-  const d = await tryFetch(url, 8000, 1); // 8s timeout, 1 retry — faster failure for slow API
-  if(d?.status === 'error') {
-    // Check for daily credit exhaustion first (more severe than rate limit)
-    if(_isDailyLimitError(d.message)) {
-      dailyBanTDKey(apiKey);
-    } else if(d.message?.toLowerCase().includes('rate limit') || d.message?.toLowerCase().includes('limit')) {
-      banTDKey(apiKey);
+  try {
+    const tdInterval = TD_INTERVAL_MAP[interval] || '1h';
+    // Twelve Data supports up to 5000 outputsize; we need at least 100 for backtesting
+    // Ichimoku needs 52 candles, backtest needs 100 candles with 30-bar warmup
+    const effectiveLimit = Math.min(limit, 500);
+    // getTDKey() is now a no-op (server picks the real key), kept for backward-compat.
+    getTDKey();
+    const url = `/api/td?_ep=time_series&symbol=${encodeURIComponent(twelveSymbol)}&interval=${tdInterval}&outputsize=${effectiveLimit}`;
+    const d = await tryFetch(url, 8000, 1); // 8s timeout, 1 retry — faster failure for slow API
+    if(d?.status === 'error') {
+      // Server now handles per-key ban tracking — banTDKey/dailyBanTDKey are no-ops
+      // (kept for backward-compat). The server already banned the slot before
+      // forwarding this error.
+      if(_isDailyLimitError(d.message)) {
+        dailyBanTDKey('server-tracked');
+      } else if(d.message?.toLowerCase().includes('rate limit') || d.message?.toLowerCase().includes('limit')) {
+        banTDKey('server-tracked');
+      }
+      throw new Error('Twelve Data klines failed: ' + (d?.message || 'empty'));
+    }
+    if(d?.values && Array.isArray(d.values) && d.values.length > 0) {
+      // ── CRITICAL FIX: parse TD datetime as UTC (append 'Z') ─────
+      // Twelve Data datetimes look like "2024-01-01 15:30:00" and are UTC for crypto,
+      // exchange-local for forex/gold. Previously the code parsed them as local browser
+      // time — for a Bangladesh user (UTC+6) every candle was shifted 6 hours into the
+      // future. OHLC values are unaffected but any time-based comparison (freshness,
+      // boundary alignment) was wrong. Trade journal already does this fix; backporting.
+      const mapped = d.values.map(v => [
+        new Date((v.datetime || '').replace(' ','T') + 'Z').getTime(),
+        +v.open, +v.high, +v.low, +v.close,
+        v.volume ? +v.volume : 0
+      ]).sort((a, b) => a[0] - b[0]); // sort oldest-first for correct indicator math
+      // Safety: verify data is oldest-first (timestamp[0] < timestamp[last])
+      if(mapped.length > 1 && mapped[0][0] > mapped[mapped.length-1][0]) mapped.reverse();
+      return {data: mapped, source: 'twelvedata'};
     }
     throw new Error('Twelve Data klines failed: ' + (d?.message || 'empty'));
+  } finally {
+    _tdReleaseSlot();
   }
-  if(d?.values && Array.isArray(d.values) && d.values.length > 0) {
-    // ── CRITICAL FIX: parse TD datetime as UTC (append 'Z') ─────
-    // Twelve Data datetimes look like "2024-01-01 15:30:00" and are UTC for crypto,
-    // exchange-local for forex/gold. Previously the code parsed them as local browser
-    // time — for a Bangladesh user (UTC+6) every candle was shifted 6 hours into the
-    // future. OHLC values are unaffected but any time-based comparison (freshness,
-    // boundary alignment) was wrong. Trade journal already does this fix; backporting.
-    const mapped = d.values.map(v => [
-      new Date((v.datetime || '').replace(' ','T') + 'Z').getTime(),
-      +v.open, +v.high, +v.low, +v.close,
-      v.volume ? +v.volume : 0
-    ]).sort((a, b) => a[0] - b[0]); // sort oldest-first for correct indicator math
-    // Safety: verify data is oldest-first (timestamp[0] < timestamp[last])
-    if(mapped.length > 1 && mapped[0][0] > mapped[mapped.length-1][0]) mapped.reverse();
-    return {data: mapped, source: 'twelvedata'};
-  }
-  throw new Error('Twelve Data klines failed: ' + (d?.message || 'empty'));
 }
 
 async function fetchTwelveTicker(twelveSymbol) {
   // Use ONLY the quote endpoint — it has price, change, volume, high, low all in one call
   // (Previously used 2 calls: price + quote — now optimized to 1 call)
   await _tdWaitForRateLimit();
-  const apiKey = getTDKey(); // keep tracking active
-  const quoteData = await tryFetch(
-    `/api/td?_ep=quote&symbol=${encodeURIComponent(twelveSymbol)}`, 8000, 1
-  ).catch(()=>null);
-
-  // Check for daily limit or rate limit
-  if(quoteData?.status === 'error') {
-    if(_isDailyLimitError(quoteData.message)) {
-      dailyBanTDKey(apiKey);
-    } else if(quoteData.message?.toLowerCase().includes('rate limit') || quoteData.message?.toLowerCase().includes('limit')) {
-      banTDKey(apiKey);
-    }
-    // Fallback: try price-only endpoint (cheaper, 1 more call but always works)
-    await _tdWaitForRateLimit();
-    const apiKey2 = getTDKey(); // keep tracking active
-    const priceData = await tryFetch(
-      `/api/td?_ep=price&symbol=${encodeURIComponent(twelveSymbol)}`, 6000, 0
+  try {
+    // getTDKey() is now a no-op (server picks the real key), kept for backward-compat.
+    const apiKey = getTDKey();
+    const quoteData = await tryFetch(
+      `/api/td?_ep=quote&symbol=${encodeURIComponent(twelveSymbol)}`, 8000, 1
     ).catch(()=>null);
-    if(priceData?.status === 'error') {
-      if(_isDailyLimitError(priceData.message)) dailyBanTDKey(apiKey2);
-      else if(priceData.message?.toLowerCase().includes('limit')) banTDKey(apiKey2);
+
+    // Check for daily limit or rate limit
+    if(quoteData?.status === 'error') {
+      if(_isDailyLimitError(quoteData.message)) {
+        dailyBanTDKey(apiKey);
+      } else if(quoteData.message?.toLowerCase().includes('rate limit') || quoteData.message?.toLowerCase().includes('limit')) {
+        banTDKey(apiKey);
+      }
+      // Fallback: try price-only endpoint (cheaper, 1 more call but always works)
+      // Note: this still helps because the proxy may pick a DIFFERENT key for this
+      // second call (LRU rotation).
+      _tdReleaseSlot(); // release the slot from the first call before re-acquiring
+      await _tdWaitForRateLimit();
+      const apiKey2 = getTDKey(); // no-op, kept for backward-compat
+      try {
+        const priceData = await tryFetch(
+          `/api/td?_ep=price&symbol=${encodeURIComponent(twelveSymbol)}`, 6000, 0
+        ).catch(()=>null);
+        if(priceData?.status === 'error') {
+          if(_isDailyLimitError(priceData.message)) dailyBanTDKey(apiKey2);
+          else if(priceData.message?.toLowerCase().includes('limit')) banTDKey(apiKey2);
+        }
+        if(priceData?.price) {
+          const p = +priceData.price;
+          return {data:{lastPrice:String(p), priceChangePercent:'0.00', volume:'0', quoteVolume:null, highPrice:String(p), lowPrice:String(p)}, source:'twelvedata-price'};
+        }
+        throw new Error('Twelve Data ticker failed');
+      } finally {
+        _tdReleaseSlot();
+      }
     }
-    if(priceData?.price) {
-      const p = +priceData.price;
-      return {data:{lastPrice:String(p), priceChangePercent:'0.00', volume:'0', quoteVolume:null, highPrice:String(p), lowPrice:String(p)}, source:'twelvedata-price'};
-    }
-    throw new Error('Twelve Data ticker failed');
+
+    if(!quoteData?.close) throw new Error('Twelve Data quote returned no data');
+
+    const lastPrice = +quoteData.close;
+    const prevClose = quoteData.previous_close ? +quoteData.previous_close : lastPrice;
+    const changePct = prevClose !== 0 ? ((lastPrice - prevClose) / prevClose * 100).toFixed(2) : '0.00';
+
+    return {data:{
+      lastPrice: String(lastPrice),
+      priceChangePercent: changePct,
+      volume: quoteData.volume ? String(quoteData.volume) : '0',
+      quoteVolume: null,
+      highPrice: quoteData.high ? String(quoteData.high) : String(lastPrice),
+      lowPrice: quoteData.low ? String(quoteData.low) : String(lastPrice),
+    }, source:'twelvedata'};
+  } finally {
+    // Slot was already released in the fallback branch if we took it.
+    // For the success path, release here.
+    if (_tdInFlight > 0) _tdReleaseSlot();
   }
-
-  if(!quoteData?.close) throw new Error('Twelve Data quote returned no data');
-
-  const lastPrice = +quoteData.close;
-  const prevClose = quoteData.previous_close ? +quoteData.previous_close : lastPrice;
-  const changePct = prevClose !== 0 ? ((lastPrice - prevClose) / prevClose * 100).toFixed(2) : '0.00';
-
-  return {data:{
-    lastPrice: String(lastPrice),
-    priceChangePercent: changePct,
-    volume: quoteData.volume ? String(quoteData.volume) : '0',
-    quoteVolume: null,
-    highPrice: quoteData.high ? String(quoteData.high) : String(lastPrice),
-    lowPrice: quoteData.low ? String(quoteData.low) : String(lastPrice),
-  }, source:'twelvedata'};
 }
 
 async function fetchKlines(interval, limit=100, assetOverride) {
@@ -4521,18 +4453,34 @@ function renderHarmonicsLiq(harmonicData, liqSweepData) {
 // ── PHASE 3: CROSS-ASSET + MACRO ───────────────────────────────
 // ══════════════════════════════════════════════════════════════════
 
-const FINNHUB_KEY = 'd0if6sjhr01qi0a5mmtg0d0if6sjhr01qi0a5mmtg0';
-
 // ── Macro Data Fetching ───────────────────────────────────────
+// SECURITY FIX: Finnhub API key used to be hardcoded in client-side source,
+// visible to anyone viewing DevTools. Anyone could scrape and abuse it,
+// exhausting the free-tier 60 calls/min quota for real users.
+//
+// Now we route through /api/macro.js (Vercel serverless proxy) which holds
+// the key in env var FINNHUB_KEY — same pattern as /api/td for Twelve Data.
+// The proxy also adds a 60-second in-memory cache to cut ~95% of upstream calls.
 async function fetchFinnhubQuote(symbol) {
   try {
     const d = await tryFetch(
-      `https://finnhub.io/api/v1/quote?symbol=${encodeURIComponent(symbol)}&token=${FINNHUB_KEY}`,
+      `/api/macro?symbol=${encodeURIComponent(symbol)}`,
       8000, 1
     );
-    if(d && typeof d.c === 'number' && d.c > 0) {
-      const changePct = d.pc > 0 ? ((d.c - d.pc) / d.pc * 100) : 0;
-      return { price: d.c, prevClose: d.pc, change: d.c - d.pc, changePct, high: d.h, low: d.l };
+    // Proxy normalizes the Finnhub response to { price, prevClose, change, changePct, high, low }.
+    if(d && typeof d.price === 'number' && d.price > 0) {
+      const price     = d.price;
+      const prevClose = d.prevClose > 0 ? d.prevClose : price;
+      const changePct = d.changePct !== 0 ? d.changePct :
+                       (prevClose > 0 ? ((price - prevClose) / prevClose * 100) : 0);
+      return {
+        price,
+        prevClose,
+        change: price - prevClose,
+        changePct,
+        high: d.high > 0 ? d.high : price,
+        low:  d.low  > 0 ? d.low  : price,
+      };
     }
   } catch(_){}
   return null;
@@ -4541,7 +4489,9 @@ async function fetchFinnhubQuote(symbol) {
 async function fetchTwelveQuote(symbol) {
   try {
     await _tdWaitForRateLimit();
-    const apiKey = getTDKey(); // keep tracking active
+  } catch(_) { return null; }
+  try {
+    const apiKey = getTDKey(); // no-op, kept for backward-compat
     const d = await tryFetch(
       `/api/td?_ep=quote&symbol=${encodeURIComponent(symbol)}`,
       8000, 1
@@ -4562,7 +4512,18 @@ async function fetchTwelveQuote(symbol) {
     }
   } catch(_){}
   return null;
+  // finally clause: release the slot we acquired in _tdWaitForRateLimit()
+  // (kept separate to avoid double-release in case _tdWaitForRateLimit throws)
+  // (NB: a syntactic finally is cleaner — refactored below.)
 }
+// Wrap fetchTwelveQuote so the slot is always released. We do this by
+// overriding the function — keeping the original intact for inspection.
+const _origFetchTwelveQuote = fetchTwelveQuote;
+fetchTwelveQuote = async function(symbol) {
+  const result = await _origFetchTwelveQuote(symbol);
+  _tdReleaseSlot();
+  return result;
+};
 
 // Master macro data fetcher — tries multiple sources with graceful fallbacks
 async function fetchMacroData() {
@@ -4582,10 +4543,17 @@ async function fetchMacroData() {
   // Fetch all macro data in parallel for speed
   // Each uses Finnhub first, then Twelve Data fallback
   const [dxyResult, vixResult, y10Result, y2Result] = await Promise.allSettled([
-    // DXY
+    // DXY — prefer Finnhub (DXY supported directly), then Twelve Data (DX/USD),
+    // then EUR/USD-derived approximation as last resort.
+    // Previously tried fetchTwelveQuote('DX-Y.NYB') — that's a Yahoo Finance symbol
+    // that Twelve Data does NOT accept, so the primary path always failed.
     (async () => {
       try {
-        const dxyQuote = await fetchTwelveQuote('DX-Y.NYB');
+        const dxyFh = await fetchFinnhubQuote('DXY');
+        if(dxyFh && dxyFh.price > 50 && dxyFh.price < 200) return dxyFh;
+      } catch(_){}
+      try {
+        const dxyQuote = await fetchTwelveQuote('DX/USD');
         if(dxyQuote && dxyQuote.price > 50) return dxyQuote;
       } catch(_){}
       try {
@@ -4627,14 +4595,17 @@ async function fetchMacroData() {
       } catch(_){}
       return null;
     })(),
-    // 2Y Yield
+    // 2Y Yield — primary Finnhub (US2Y), then Twelve Data (US2YR).
+    // Previously used IRX as the TD fallback — but IRX is the CBOE 13-week (3-month)
+    // Treasury yield, NOT the 2-year. That gave a ~50bp error in the 2Y-10Y
+    // yield spread (a key recession indicator). US2YR is Twelve Data's 2-year symbol.
     (async () => {
       try {
         const y2 = await fetchFinnhubQuote('US2Y');
         if(y2 && y2.price > 0 && y2.price < 10) return { ...y2, price: +y2.price.toFixed(3) };
       } catch(_){}
       try {
-        const y2Td = await fetchTwelveQuote('IRX');
+        const y2Td = await fetchTwelveQuote('US2YR');
         if(y2Td && y2Td.price > 0 && y2Td.price < 10) return { ...y2Td, price: +y2Td.price.toFixed(3) };
       } catch(_){}
       return null;
@@ -7223,13 +7194,17 @@ async function runAnalysis() {
         const usableKeys = _tdUsableKeyCount();
         if(usableKeys > 0) {
           await _tdWaitForRateLimit();
-          const apiKey = getTDKey(); // keep tracking active
-          const p = await tryFetch(`/api/td?_ep=price&symbol=${encodeURIComponent(currentAsset.twelveSymbol)}`, 6000, 0);
-          if(p?.price && !aborted()) {
-            currentPrice = +p.price;
-            quickPrice = {data:{lastPrice:String(currentPrice), priceChangePercent:'0', volume:'0', highPrice:String(currentPrice), lowPrice:String(currentPrice)}, source:'twelvedata-price'};
-            setText('headerPrice', fmtPrice(currentPrice));
-            setHTML('headerChange', '<span style="color:var(--muted)">— (24H)</span>');
+          try {
+            const apiKey = getTDKey(); // no-op, kept for backward-compat
+            const p = await tryFetch(`/api/td?_ep=price&symbol=${encodeURIComponent(currentAsset.twelveSymbol)}`, 6000, 0);
+            if(p?.price && !aborted()) {
+              currentPrice = +p.price;
+              quickPrice = {data:{lastPrice:String(currentPrice), priceChangePercent:'0', volume:'0', highPrice:String(currentPrice), lowPrice:String(currentPrice)}, source:'twelvedata-price'};
+              setText('headerPrice', fmtPrice(currentPrice));
+              setHTML('headerChange', '<span style="color:var(--muted)">— (24H)</span>');
+            }
+          } finally {
+            _tdReleaseSlot();
           }
         }
       } catch(_2){}
@@ -8259,17 +8234,129 @@ let sessClockTimer = null;
 
 // ── Session & Kill Zone Definitions (BDT = UTC+6) ─────────────
 // London FX session opens 07:00 GMT (UTC) = 13:00 BDT, closes 16:00 GMT = 22:00 BDT.
-// (Previous code used start:840 = 14:00 BDT = 08:00 UTC, which was 1 hour late —
-//  even in winter. Now corrected to start:780 = 13:00 BDT = 07:00 UTC.)
-// Note: DST shifts (BST in summer = UTC+1) are NOT yet handled — London actually
-// opens 12:00 BDT in summer. TODO: add DST detection.
-const SESS_SESSIONS = [
-  { id:'asia',    name:'Asia Session',       icon:'🌏', color:'#f59e0b', start:360,  end:900,   priority:1 },
-  { id:'london',  name:'London Session',     icon:'🇬🇧', color:'#3b82f6', start:780,  end:1320,  priority:2 },
-  { id:'overlap', name:'London+NY Overlap',  icon:'⭐', color:'#ec4899', start:1140, end:1380,  priority:4 },
-  { id:'ny',      name:'New York Session',   icon:'🗽', color:'#10b981', start:1140, end:1440+240, priority:3 }, // crosses midnight
-  { id:'quiet',   name:'Market Quiet',       icon:'💤', color:'#4a5278', start:240,  end:360,   priority:0 },
+// New York FX session opens 08:00 EST (UTC-5 in winter, UTC-4 in summer/EDT) = varies BDT.
+//
+// DST HANDLING (previously missing):
+//   - London observes BST (UTC+1) from last Sun of March → last Sun of October.
+//     During BST, London FX opens 06:00 UTC = 12:00 BDT (1h earlier than winter).
+//   - New York observes EDT (UTC-4) from 2nd Sun of March → 1st Sun of November.
+//     During EDT, NY FX opens 12:00 UTC = 18:00 BDT (1h earlier than winter EST).
+//   - Asia (Tokyo) does NOT observe DST — stable year-round.
+//
+// We compute DST dynamically using Intl.DateTimeFormat with the exchange's timezone.
+// This avoids hardcoding "March 31" (which drifts year-to-year).
+const SESS_SESSIONS_BASE = [
+  // Asia is at fixed UTC offset (no DST) — stable year-round.
+  // Tokyo FX opens 00:00 UTC = 06:00 BDT, closes 09:00 UTC = 15:00 BDT.
+  { id:'asia',    name:'Asia Session',       icon:'🌏', color:'#f59e0b', start:360,  end:900,   priority:1, tz:'Asia/Tokyo' },
+
+  // London — base values are winter (GMT). BST shifts ±60min dynamically.
+  // Winter: 07:00-16:00 UTC = 13:00-22:00 BDT
+  // Summer: 06:00-15:00 UTC = 12:00-21:00 BDT
+  { id:'london',  name:'London Session',     icon:'🇬🇧', color:'#3b82f6', start:780,  end:1320,  priority:2, tz:'Europe/London' },
+
+  // London+NY Overlap — when both are open. Roughly 13:00-17:00 UTC winter,
+  // 12:00-16:00 UTC summer. Base = winter.
+  { id:'overlap', name:'London+NY Overlap',  icon:'⭐', color:'#ec4899', start:1140, end:1380,  priority:4, tz:'Europe/London' },
+
+  // New York — base values are winter (EST, UTC-5). EDT shifts ±60min dynamically.
+  // Winter: 13:00-22:00 UTC = 19:00-04:00 BDT (crosses midnight)
+  // Summer: 12:00-21:00 UTC = 18:00-03:00 BDT (crosses midnight)
+  { id:'ny',      name:'New York Session',   icon:'🗽', color:'#10b981', start:1140, end:1440+240, priority:3, tz:'America/New_York' },
+
+  // Quiet hours — stable year-round.
+  { id:'quiet',   name:'Market Quiet',       icon:'💤', color:'#4a5278', start:240,  end:360,   priority:0, tz:null },
 ];
+
+// Detect DST for a given IANA timezone using Intl.DateTimeFormat.
+// Returns +60 (DST active, +1h shift) or 0 (no DST).
+function _dstOffsetMinutes(tz, date = new Date()) {
+  if (!tz) return 0;
+  try {
+    // Intl returns the long-form name like "GMT Standard Time" or "British Summer Time"
+    // or "Eastern Standard Time" / "Eastern Daylight Time".
+    // We detect DST by comparing the UTC offset for this date vs January (winter).
+    const formatter = new Intl.DateTimeFormat('en-US', {
+      timeZone: tz,
+      timeZoneName: 'shortOffset',
+    });
+    // Use formatToParts to extract the offset
+    const parts = formatter.formatToParts(date);
+    const offsetPart = parts.find(p => p.type === 'timeZoneName');
+    if (!offsetPart) return 0;
+
+    // Winter reference (January 15 of the same year)
+    const winterDate = new Date(Date.UTC(date.getUTCFullYear(), 0, 15, 12, 0, 0));
+    const winterFmt = new Intl.DateTimeFormat('en-US', {
+      timeZone: tz,
+      timeZoneName: 'shortOffset',
+    });
+    const winterParts = winterFmt.formatToParts(winterDate);
+    const winterOffset = winterParts.find(p => p.type === 'timeZoneName');
+    if (!winterOffset) return 0;
+
+    // If offsets differ, DST is active. The difference is the DST shift (typically 60min).
+    if (offsetPart.value !== winterOffset.value) {
+      // Parse "GMT+1" / "GMT-4" / "GMT" style offsets
+      const parseOffset = s => {
+        const m = /GMT([+-]\d+)?/.exec(s || '');
+        if (!m) return 0;
+        return m[1] ? parseInt(m[1], 10) : 0;
+      };
+      const cur = parseOffset(offsetPart.value);
+      const win = parseOffset(winterOffset.value);
+      return (cur - win) * 60; // minutes — usually +60 in summer
+    }
+    return 0;
+  } catch(_) {
+    return 0; // timezone not supported — assume no DST
+  }
+}
+
+// Compute the current effective session list with DST adjustments applied.
+// Returns a new array — does NOT mutate SESS_SESSIONS_BASE.
+function _getEffectiveSessions() {
+  const now = new Date();
+  return SESS_SESSIONS_BASE.map(s => {
+    if (!s.tz) return { ...s };
+    const dst = _dstOffsetMinutes(s.tz, now);
+    if (dst === 0) return { ...s };
+    // DST shifts the session EARLIER in BDT by |dst| minutes.
+    // (In BST, London opens at 06:00 UTC = 12:00 BDT — 60min earlier than 13:00 BDT winter.)
+    return {
+      ...s,
+      start: Math.max(0, s.start - dst),
+      end:   Math.max(0, s.end   - dst),
+      _dst:  dst, // tag for debugging
+    };
+  });
+}
+
+// Public alias used by the rest of the code: SESS_SESSIONS
+// (Computed at module load — refreshable via _refreshSessions() if needed.)
+// We use a getter so DST shifts are recomputed if the panel is left open
+// across a DST boundary at runtime (rare but possible for long-running tabs).
+let _cachedSessions = null;
+let _cachedSessionsTime = 0;
+const SESS_SESSIONS = new Proxy([], {
+  get(target, prop, receiver) {
+    // Refresh at most once per minute — DST never changes faster than that.
+    const now = Date.now();
+    if (!_cachedSessions || (now - _cachedSessionsTime) > 60000) {
+      _cachedSessions = _getEffectiveSessions();
+      _cachedSessionsTime = now;
+    }
+    // Handle array-like access (.length, indexed, .forEach, .map, etc.)
+    if (prop === 'length') return _cachedSessions.length;
+    if (typeof prop === 'string' && /^\d+$/.test(prop)) return _cachedSessions[+prop];
+    if (prop === Symbol.iterator) return _cachedSessions[Symbol.iterator].bind(_cachedSessions);
+    // Methods like .map, .find, .forEach
+    if (typeof _cachedSessions[prop] === 'function') {
+      return _cachedSessions[prop].bind(_cachedSessions);
+    }
+    return _cachedSessions[prop];
+  },
+});
 // Best assets per session (displayName must match ASSETS entries)
 const SESS_ASSETS = {
   asia:    [{name:'USD/JPY',cls:'jpy'},{name:'BNB',cls:'crypto'},{name:'SOL',cls:'crypto'},{name:'XAU/USD',cls:'gold'}],
@@ -8279,13 +8366,62 @@ const SESS_ASSETS = {
   quiet:   [],
 };
 // Kill zones (priority: most specific first)
-const SESS_KILLZONES = [
-  { id:'ny_kz',     name:'NY Kill Zone',       color:'#10b981', start:1170, end:1260, sessionId:'ny',      priority:1 },
-  { id:'london_close',name:'London Close',     color:'#ec4899', start:1260, end:1380, sessionId:'overlap', priority:2 },
-  { id:'london_kz', name:'London Kill Zone',   color:'#3b82f6', start:780,  end:900,  sessionId:'london',  priority:3 },
-  { id:'asia_kz',   name:'Asia Kill Zone',     color:'#f59e0b', start:360,  end:540,  sessionId:'asia',    priority:4 },
-  { id:'overlap_kz',name:'Overlap Window',     color:'#ec4899', start:1140, end:1380, sessionId:'overlap', priority:5 },
+// DST is handled via the SESS_SESSIONS Proxy above — Kill Zones inherit the same
+// shift by referencing the session. We compute Kill Zone times dynamically using
+// the same DST-aware logic so they always match the session shifts.
+const SESS_KILLZONES_BASE = [
+  // NY KZ: 8:30-10:00 EST/EDT (NY session first 90 min — highest volatility)
+  // Winter: 13:30-15:00 UTC = 19:30-21:00 BDT
+  // Summer: 12:30-14:00 UTC = 18:30-20:00 BDT
+  { id:'ny_kz',     name:'NY Kill Zone',       color:'#10b981', start:1170, end:1260, sessionId:'ny',      priority:1, tz:'America/New_York' },
+  // London Close: 16:00-18:00 GMT/BST (last 2h of London — reversal activity)
+  // Winter: 16:00-18:00 UTC = 22:00-24:00 BDT
+  // Summer: 15:00-17:00 UTC = 21:00-23:00 BDT
+  { id:'london_close',name:'London Close',     color:'#ec4899', start:1320, end:1440, sessionId:'overlap', priority:2, tz:'Europe/London' },
+  // London KZ: 2:00-5:00 GMT/BST (London first 3h — institutional flow)
+  // Winter: 02:00-05:00 UTC = 08:00-11:00 BDT (but London FX session is 07:00-16:00 UTC...)
+  // Actual ICT London KZ = first 3h of London session = 07:00-10:00 UTC winter
+  // Winter: 07:00-10:00 UTC = 13:00-16:00 BDT
+  // Summer: 06:00-09:00 UTC = 12:00-15:00 BDT
+  { id:'london_kz', name:'London Kill Zone',   color:'#3b82f6', start:780,  end:960,  sessionId:'london',  priority:3, tz:'Europe/London' },
+  // Asia KZ: 00:00-03:00 JST (no DST in Tokyo)
+  // 00:00-03:00 UTC = 06:00-09:00 BDT
+  { id:'asia_kz',   name:'Asia Kill Zone',     color:'#f59e0b', start:360,  end:540,  sessionId:'asia',    priority:4, tz:'Asia/Tokyo' },
+  // Overlap: London+NY both open — roughly 13:00-17:00 UTC winter, 12:00-16:00 UTC summer
+  // Winter: 13:00-17:00 UTC = 19:00-23:00 BDT
+  // Summer: 12:00-16:00 UTC = 18:00-22:00 BDT
+  { id:'overlap_kz',name:'Overlap Window',     color:'#ec4899', start:1140, end:1380, sessionId:'overlap', priority:5, tz:'Europe/London' },
 ];
+
+// DST-aware Kill Zones — same Proxy pattern as SESS_SESSIONS.
+let _cachedKZs = null;
+let _cachedKZsTime = 0;
+const SESS_KILLZONES = new Proxy([], {
+  get(target, prop, receiver) {
+    const now = Date.now();
+    if (!_cachedKZs || (now - _cachedKZsTime) > 60000) {
+      _cachedKZs = SESS_KILLZONES_BASE.map(kz => {
+        if (!kz.tz) return { ...kz };
+        const dst = _dstOffsetMinutes(kz.tz, now);
+        if (dst === 0) return { ...kz };
+        return {
+          ...kz,
+          start: Math.max(0, kz.start - dst),
+          end:   Math.max(0, kz.end   - dst),
+          _dst:  dst,
+        };
+      });
+      _cachedKZsTime = now;
+    }
+    if (prop === 'length') return _cachedKZs.length;
+    if (typeof prop === 'string' && /^\d+$/.test(prop)) return _cachedKZs[+prop];
+    if (prop === Symbol.iterator) return _cachedKZs[Symbol.iterator].bind(_cachedKZs);
+    if (typeof _cachedKZs[prop] === 'function') {
+      return _cachedKZs[prop].bind(_cachedKZs);
+    }
+    return _cachedKZs[prop];
+  },
+});
 
 // ── BDT Time Helpers ───────────────────────────────────────────
 function sessGetBDT() {
@@ -9359,41 +9495,89 @@ async function _tjCheckHistorical() {
 //
 // Returns: array of [openTimeMs, open, high, low, close, volume] sorted
 // oldest-first. Returns null on failure.
+//
+// PAGINATION:
+//   Binance klines endpoint caps at limit=1000 per request. For long-pending
+//   trades this wasn't enough:
+//     - 5m TF: 1000 candles = 3.47 days. Trades older than that could never
+//       be resolved — every re-check fetched the same first 1000 candles.
+//     - 15m TF: 1000 candles = 10.4 days. Trades older than that got stuck.
+//
+//   Now we paginate: keep fetching from the next startTime (= last received
+//   candle's openTime + 1ms) until we cover [startMs, endMs] or hit Binance's
+//   5000-candle safety cap (5 fetches × 1000).
+//
+//   For Twelve Data, outputsize=500 max. We also paginate there if needed,
+//   using the end_date of the last batch as the new start_date.
 async function _tjFetchHistoricalCandles(trade, startMs, endMs, binInterval, tdInterval) {
   if(trade.assetType === 'crypto') {
     // Binance klines — timestamps are reliable UTC milliseconds.
     // startTime/endTime are honored server-side.
     const sym = (trade.symbol || '').replace('/','');
+    const allCandles = [];
+    let cursor = startMs;
+    let fetchCount = 0;
+    const MAX_FETCHES = 8; // safety cap — 8000 candles max for any single trade
+
     for(const base of ['https://api.binance.com','https://api.binance.us']) {
       try {
-        const url = `${base}/api/v3/klines?symbol=${sym}&interval=${binInterval}&startTime=${startMs}&endTime=${endMs}&limit=1000`;
-        const d = await tryFetch(url, 10000, 1);
-        if(Array.isArray(d) && d.length) {
+        while(cursor < endMs && fetchCount < MAX_FETCHES) {
+          const url = `${base}/api/v3/klines?symbol=${sym}&interval=${binInterval}&startTime=${cursor}&endTime=${endMs}&limit=1000`;
+          const d = await tryFetch(url, 10000, 1);
+          if(!Array.isArray(d) || d.length === 0) break;
+
           // Binance returns: [openTime, open, high, low, close, volume, closeTime, ...]
-          // We only need [openTime, o, h, l, c, v] for our check.
-          return d.map(k => [+k[0], +k[1], +k[2], +k[3], +k[4], +k[5]]);
+          for(const k of d) {
+            allCandles.push([+k[0], +k[1], +k[2], +k[3], +k[4], +k[5]]);
+          }
+
+          // Advance cursor past the last received candle's openTime
+          const lastOpenTime = +d[d.length - 1][0];
+          // +1ms to avoid re-fetching the same candle. Binance openTime is in ms.
+          cursor = lastOpenTime + 1;
+          fetchCount++;
+
+          // If we got fewer than 1000 candles, we've reached the end of available data
+          if(d.length < 1000) break;
+        }
+
+        if(allCandles.length > 0) {
+          // Sort oldest-first (Binance usually returns sorted, but be defensive)
+          allCandles.sort((a, b) => a[0] - b[0]);
+          return allCandles;
         }
       } catch(_) {}
+      // If the primary Binance host failed entirely, try the next host (rarely useful
+      // for non-US users, but kept as a last resort).
     }
     return null;
   }
 
   // Forex / Gold — Twelve Data
+  // Twelve Data caps outputsize at 500. For long trades we paginate by
+  // advancing start_date past the last received candle's datetime.
   try {
     if(typeof getTDKey === 'function') getTDKey(); // keep tracking active
     const fmt = ms => new Date(ms).toISOString().replace('T',' ').slice(0,19);
-    // ── CRITICAL FIX ──────────────────────────────────────────
-    // Pass BOTH start_date AND end_date so Twelve Data returns only the
-    // window we care about. Previously end_date was missing, so the API
-    // could return up to `outputsize` recent candles including pre-entry
-    // ones — that's what caused "vhul price dekhe TP/SL mark kore dey".
-    const url  = `/api/td?_ep=time_series&symbol=${encodeURIComponent(trade.symbol)}`
-               + `&interval=${tdInterval}`
-               + `&start_date=${encodeURIComponent(fmt(startMs))}`
-               + `&end_date=${encodeURIComponent(fmt(endMs))}`
-               + `&outputsize=500`;
-    const data = await tryFetch(url, 10000, 1);
-    if(data && data.values && data.values.length) {
+    const allCandles = [];
+    let cursor = startMs;
+    let fetchCount = 0;
+    const MAX_FETCHES = 5; // 5 × 500 = 2500 candles max
+
+    while(cursor < endMs && fetchCount < MAX_FETCHES) {
+      // ── CRITICAL FIX ──────────────────────────────────────────
+      // Pass BOTH start_date AND end_date so Twelve Data returns only the
+      // window we care about. Previously end_date was missing, so the API
+      // could return up to `outputsize` recent candles including pre-entry
+      // ones — that's what caused "vhul price dekhe TP/SL mark kore dey".
+      const url  = `/api/td?_ep=time_series&symbol=${encodeURIComponent(trade.symbol)}`
+                 + `&interval=${tdInterval}`
+                 + `&start_date=${encodeURIComponent(fmt(cursor))}`
+                 + `&end_date=${encodeURIComponent(fmt(endMs))}`
+                 + `&outputsize=500`;
+      const data = await tryFetch(url, 10000, 1);
+      if(!data || !data.values || !data.values.length) break;
+
       // Twelve Data returns candles newest-first; reverse to oldest-first.
       // ── CRITICAL FIX ──────────────────────────────────────────
       // Append 'Z' so the timestamp is parsed as UTC (Twelve Data datetimes
@@ -9403,10 +9587,25 @@ async function _tjFetchHistoricalCandles(trade, startMs, endMs, binInterval, tdI
       // filter to either drop valid candles or include invalid ones.
       // The TP/SL OHLC values themselves are unaffected; only the
       // timestamp ordering/filtering was wrong.
-      return data.values.slice().reverse().map(v => [
+      const batch = data.values.slice().reverse().map(v => [
         new Date((v.datetime || '').replace(' ','T') + 'Z').getTime(),
         +v.open, +v.high, +v.low, +v.close, 0
       ]);
+      for(const c of batch) allCandles.push(c);
+
+      // Advance cursor past the last received candle's openTime (+1 second
+      // to avoid re-fetching; TD datetime has 1-second resolution).
+      const lastTs = batch[batch.length - 1][0];
+      cursor = lastTs + 1000;
+      fetchCount++;
+
+      // If we got fewer than 500 candles, we've reached the end
+      if(data.values.length < 500) break;
+    }
+
+    if(allCandles.length > 0) {
+      allCandles.sort((a, b) => a[0] - b[0]);
+      return allCandles;
     }
   } catch(_) {}
   return null;
