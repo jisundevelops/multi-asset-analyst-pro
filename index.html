@@ -9043,6 +9043,58 @@ document.addEventListener('visibilitychange', () => {
 
 // ══════════════════════════════════════════════════════════════
 // TRADE JOURNAL — Auto-logging, Outcome Tracking, Analytics
+// ══════════════════════════════════════════════════════════════════
+//
+// ── TIME ALIGNMENT POLICY (CRITICAL) ──────────────────────────────
+// The entire system uses UTC as the single source of truth for time.
+// This is essential because data comes from multiple sources with
+// different native time formats:
+//
+//   Binance API:      UTC milliseconds (k[0] = openTime in UTC ms)
+//   Twelve Data:      "2024-01-01 15:30:00" strings (UTC for crypto,
+//                      exchange-local for forex/gold — we append Z
+//                      to force UTC parsing)
+//   Yahoo Finance:    Unix seconds (regularMarketTime) — x1000 for ms
+//   mempool.space:    Unix seconds — display only, no comparison
+//   blockchain.info:  plain numbers — display only
+//   CoinGecko:        Unix ms — display only
+//
+// Trade journal timestamps:
+//   - Stored as ISO UTC strings (toISOString always returns UTC with Z)
+//   - Converted to UTC ms for comparison (new Date(isoString).getTime())
+//   - All candle window calculations use UTC ms (Date.now() is UTC ms)
+//
+// History check flow (fully UTC-aligned):
+//   1. Trade logged: timestamp = now.toISOString() -> UTC ISO string
+//   2. entryMs = new Date(trade.timestamp).getTime() -> UTC ms
+//   3. startMs = entryMs + candleMs -> UTC ms (skip entry candle)
+//   4. endMs = Date.now() -> UTC ms
+//   5. Binance: startTime=startMs&endTime=endMs -> UTC ms
+//   6. Twelve Data: start_date=ISO(startMs)&end_date=ISO(endMs) -> UTC ISO
+//   7. Candle openTime: Binance +k[0] (UTC ms), TD new Date(dt+Z).getTime() (UTC ms)
+//   8. Filter: c[0] >= startMs -> UTC ms vs UTC ms
+//   9. Outcome: new Date(openTime).toISOString() -> UTC ISO
+//
+// Display conversion:
+//   - toLocaleTimeString(en-BD, {hour,minute}) converts UTC -> user local
+//     time for display. Stored data is UTC, display is local. Standard.
+//
+// Session times (Hot Sessions panel):
+//   - Computed in BDT (UTC+6) using sessGetBDT() which correctly converts
+//     from any user timezone to BDT. Sessions are display-only — they
+//     dont interact with trade journal data alignment.
+//
+// ── TRADE OBJECT TIME FIELDS (all UTC) ────────────────────────────
+//   timestamp:    ISO UTC string (e.g., 2024-01-01T19:00:00.000Z)
+//   date:         UTC date (YYYY-MM-DD from toISOString)
+//   hour:         UTC hour (0-23, getUTCHours)
+//   dayName:      UTC day name (getUTCDay -> dayNames[])
+//   dayIndex:     UTC day index (0=Sunday, getUTCDay)
+//   closedAt:     ISO UTC string (when trade closed)
+//   tp1HitAt:     ISO UTC string (when TP1 was first hit)
+//   lastHistoricalCheck: UTC ms timestamp (Date.now())
+//
+// ══════════════════════════════════════════════════════════════════
 // ══════════════════════════════════════════════════════════════
 const TJ_KEY = 'btc_analyst_journal_v1';
 let _tjOpen = false;
@@ -9582,8 +9634,26 @@ function autoLogTrade(results, bestTF, price, masterScoreVal, asset, gateResult,
       masterScore: masterScoreVal,
       timestamp: now.toISOString(),
       date: now.toISOString().split('T')[0],
-      dayName: dayNames[now.getDay()],
-      dayIndex: now.getDay(),
+      // ── TIME ALIGNMENT FIX ──────────────────────────────────────
+      // Previously dayName/dayIndex used now.getDay() (LOCAL browser day)
+      // while hour used now.getUTCHours() (UTC) and date used toISOString() (UTC).
+      // This caused mismatches: a trade at 01:00 BDT Tuesday (19:00 UTC Monday)
+      // would show dayName="Tuesday" but date="2024-01-01" (Monday UTC) and
+      // hour=19 (UTC Monday). Analytics day-stats and hour-stats were grouped
+      // inconsistently.
+      //
+      // Now ALL time fields are UTC-aligned:
+      //   - timestamp: ISO UTC string
+      //   - date: UTC date (YYYY-MM-DD from toISOString)
+      //   - hour: UTC hour (getUTCHours)
+      //   - dayName: UTC day name (getUTCDay)
+      //   - dayIndex: UTC day index (getUTCDay)
+      //
+      // This matches the "Time Block (UTC)" label in analytics and keeps
+      // day-stats consistent with hour-stats. Display conversion to local
+      // time happens at render time (toLocaleTimeString with locale).
+      dayName: dayNames[now.getUTCDay()],
+      dayIndex: now.getUTCDay(),
       hour: now.getUTCHours(), // UTC hour matches the "Time Block (UTC)" label in analytics
       status: 'pending', // pending | win_tp1 | win_tp2 | loss | breakeven
       closedAt: null,
