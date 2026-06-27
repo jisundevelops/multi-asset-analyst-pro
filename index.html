@@ -10145,14 +10145,80 @@ function checkOpenTrades(currentPriceVal, asset) {
       const _liveSkipMs = TF_HALF_MS[t.timeframe] || (2 * 60 * 1000);
       if(_now - new Date(t.timestamp).getTime() < _liveSkipMs) return;
 
+      // ── PRO TRADER TWO-TIER TP LOGIC (matches _tjCheckHistorical) ──
+      // Standard hedge fund approach:
+      //   1. TP1 hit → close 50% position, move SL to entry (breakeven)
+      //   2. TP2 hit → close remaining 50% → win_tp2
+      //   3. SL hit after TP1 → breakeven exit (SL at entry)
+      //   4. SL hit before TP1 → full loss (-1R)
+      //
+      // We track tp1HitAt so live check and historical check agree.
+      // Previously live check just marked win_tp1/loss without tracking
+      // TP1 → inconsistent with historical check's breakeven logic.
+      const tp1AlreadyHit = !!t.tp1HitAt;
+      const _closeAndRecord = (status, closedPrice, pnlR) => {
+        t.status = status;
+        t.closedAt = now;
+        t.closedPrice = closedPrice;
+        // Compute and store P&L (R-multiple + $ amount)
+        const _pnl = calcTradePnL({ ...t, status, closedPrice }, t.riskAmount);
+        t.pnlUsd = _pnl.pnlUsd;
+        t.pnlR = _pnl.pnlR;
+        changed = true;
+      };
+
       if(t.direction === 'LONG') {
-        if(currentPriceVal >= +t.tp2)      { t.status='win_tp2'; t.closedAt=now; t.closedPrice=currentPriceVal; changed=true; }
-        else if(currentPriceVal >= +t.tp1) { t.status='win_tp1'; t.closedAt=now; t.closedPrice=currentPriceVal; changed=true; }
-        else if(currentPriceVal <= +t.sl)  { t.status='loss';    t.closedAt=now; t.closedPrice=currentPriceVal; changed=true; }
+        if(tp1AlreadyHit) {
+          // Breakeven mode: SL is at entry. Check TP2 first (runner active).
+          if(currentPriceVal >= +t.tp2) {
+            _closeAndRecord('win_tp2', +t.tp2);
+          } else if(currentPriceVal <= +t.entry) {
+            // Price touched entry → breakeven exit
+            _closeAndRecord('breakeven', +t.entry);
+          }
+          // Price between entry and TP2 → still open, no action
+        } else {
+          // Normal mode (TP1 not yet hit)
+          // Check TP2 first (further target) — if hit, implies TP1 also touched
+          if(currentPriceVal >= +t.tp2) {
+            // TP2 hit → also record TP1 hit (for P&L accuracy)
+            t.tp1HitAt = now;
+            t.tp1HitPrice = +t.tp1;
+            _closeAndRecord('win_tp2', +t.tp2);
+          } else if(currentPriceVal >= +t.tp1) {
+            // TP1 hit only → record, but DON'T close trade (50% remains)
+            t.tp1HitAt = now;
+            t.tp1HitPrice = +t.tp1;
+            changed = true;
+            // Trade stays 'pending' — waiting for TP2 or SL (now at entry)
+          } else if(currentPriceVal <= +t.sl) {
+            // SL hit before TP1 → full loss
+            _closeAndRecord('loss', +t.sl);
+          }
+        }
       } else { // SHORT
-        if(currentPriceVal <= +t.tp2)      { t.status='win_tp2'; t.closedAt=now; t.closedPrice=currentPriceVal; changed=true; }
-        else if(currentPriceVal <= +t.tp1) { t.status='win_tp1'; t.closedAt=now; t.closedPrice=currentPriceVal; changed=true; }
-        else if(currentPriceVal >= +t.sl)  { t.status='loss';    t.closedAt=now; t.closedPrice=currentPriceVal; changed=true; }
+        if(tp1AlreadyHit) {
+          // Breakeven mode: SL is at entry.
+          if(currentPriceVal <= +t.tp2) {
+            _closeAndRecord('win_tp2', +t.tp2);
+          } else if(currentPriceVal >= +t.entry) {
+            _closeAndRecord('breakeven', +t.entry);
+          }
+        } else {
+          // Normal mode (TP1 not yet hit)
+          if(currentPriceVal <= +t.tp2) {
+            t.tp1HitAt = now;
+            t.tp1HitPrice = +t.tp1;
+            _closeAndRecord('win_tp2', +t.tp2);
+          } else if(currentPriceVal <= +t.tp1) {
+            // TP1 hit only → record, don't close
+            t.tp1HitAt = now;
+            t.tp1HitPrice = +t.tp1;
+            changed = true;
+          } else if(currentPriceVal >= +t.sl) {
+            _closeAndRecord('loss', +t.sl);
+          }
+        }
       }
     });
 
@@ -10727,6 +10793,10 @@ async function _tjCheckHistorical() {
         t.closedAt          = new Date(outcomeTime).toISOString();
         t.closedPrice       = outcomePrice;
         t.resolvedByHistory = true;
+        // Compute and store P&L (R-multiple + $ amount) — needed for equity curve
+        const _pnl = calcTradePnL({ ...t, status: outcome, closedPrice: outcomePrice }, t.riskAmount);
+        t.pnlUsd = _pnl.pnlUsd;
+        t.pnlR = _pnl.pnlR;
       } else {
         t.lastHistoricalCheck = _nowMs; // checked but still open
       }
