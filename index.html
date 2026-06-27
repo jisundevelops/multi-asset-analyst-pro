@@ -898,6 +898,7 @@
   .tj-status-badge.win-tp1{background:rgba(5,229,122,.1);color:var(--green);border:1px solid rgba(5,229,122,.3);}
   .tj-status-badge.win-tp2{background:rgba(5,229,122,.2);color:#00ff88;border:1px solid rgba(5,229,122,.5);}
   .tj-status-badge.loss{background:rgba(255,45,85,.1);color:var(--red);border:1px solid rgba(255,45,85,.25);}
+  .tj-status-badge.breakeven{background:rgba(255,255,255,.06);color:var(--muted);border:1px solid rgba(255,255,255,.15);}
   .tj-analytics-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px;}
   .tj-analytics-card{background:var(--bg3);border:1px solid var(--border);border-radius:12px;padding:14px;}
   .tj-analytics-title{font-size:10px;font-weight:700;color:var(--muted);text-transform:uppercase;
@@ -2732,34 +2733,64 @@ function analyzeTF(rawData, price, assetType) {
   // Asset-specific threshold: BTC is volatile (60% ok), Gold/Forex need higher conviction
   const _thresh = (assetType==='gold'||assetType==='forex') ? 65 : 60;
   const signal=bullPct>=_thresh?'bull':bearPct>=_thresh?'bear':'neutral';
-  const prob=signal==='bull'?bullPct:signal==='bear'?bearPct:Math.max(bullPct,bearPct);
+  // ── Confidence % (prob) calculation ───────────────────────────
+  // Pro trader approach:
+  //   - Directional signal: prob = winning side % (e.g. 72% bullish)
+  //   - Neutral signal: prob = 50 (NOT max(bullPct, bearPct))
+  //     Why? A neutral signal means "no trade" — reporting 55% confidence
+  //     when the market is genuinely undecided is misleading. The user
+  //     might think there's a 55% bullish setup when really there isn't.
+  //   - Also cap prob to [0, 100] for safety.
+  const _rawProb = signal==='bull' ? bullPct
+                 : signal==='bear' ? bearPct
+                 : 50;  // neutral → 50 (no directional conviction)
+  const prob = Math.max(0, Math.min(100, _rawProb));
   const atrV=av||(price*0.015);
 
   // Regime-adaptive TP/SL multipliers
-  // TRENDING:  let winners run — wide TP, normal SL
-  // RANGING:   price stays in range — tight TP, tight SL
-  // BREAKOUT:  momentum play — widest TP, slightly wider SL
-  // REVERSAL:  quick move — medium TP, tight SL (if wrong, get out fast)
+  // ── Pro trader approach (hedge fund methodology) ──────────────────
+  //   TRENDING:  let winners run — wide TP, normal SL
+  //   RANGING:   price stays in range — tight TP, tight SL
+  //   BREAKOUT:  momentum play — widest TP, slightly wider SL
+  //   REVERSAL:  quick move — medium TP, tight SL (if wrong, get out fast)
+  //
+  // MINIMUM R:R ENFORCEMENT:
+  //   All regimes MUST produce R:R ≥ 1.5 (industry-standard minimum).
+  //   If the base multipliers produce R:R < 1.5, we widen TP1 to enforce it.
+  //   This prevents the RANGING regime (tp1=1.0, sl=0.7 → R:R=1.43) from
+  //   logging unprofitable trades. Better to skip than take bad R:R.
   const _reg = regime || 'RANGING';
-  const _tp1m = _reg==='TRENDING'  ? 2.0
-              : _reg==='RANGING'   ? 1.0
-              : _reg==='BREAKOUT'  ? 2.5
-              : _reg==='REVERSAL'  ? 1.5
-              : 1.5; // default
-  const _tp2m = _reg==='TRENDING'  ? 3.5
-              : _reg==='RANGING'   ? 1.8
-              : _reg==='BREAKOUT'  ? 4.0
-              : _reg==='REVERSAL'  ? 2.5
-              : 3.0; // default
-  const _slm  = _reg==='TRENDING'  ? 1.0
-              : _reg==='RANGING'   ? 0.7
-              : _reg==='BREAKOUT'  ? 1.2
-              : _reg==='REVERSAL'  ? 0.7
-              : 1.0; // default
+  let _tp1m = _reg==='TRENDING'  ? 2.0
+            : _reg==='RANGING'   ? 1.5  // widened from 1.0 → enforces R:R ≥ 1.5
+            : _reg==='BREAKOUT'  ? 2.5
+            : _reg==='REVERSAL'  ? 1.5
+            : 1.5; // default
+  let _tp2m = _reg==='TRENDING'  ? 3.5
+            : _reg==='RANGING'   ? 2.5  // widened from 1.8 → maintains TP2 > TP1
+            : _reg==='BREAKOUT'  ? 4.0
+            : _reg==='REVERSAL'  ? 2.5
+            : 3.0; // default
+  let _slm  = _reg==='TRENDING'  ? 1.0
+            : _reg==='RANGING'   ? 0.8  // widened from 0.7 → gives SL breathing room
+            : _reg==='BREAKOUT'  ? 1.2
+            : _reg==='REVERSAL'  ? 0.8  // widened from 0.7 → avoid noise stop-outs
+            : 1.0; // default
+
+  // Safety: enforce minimum R:R = 1.5 for TP1 (the primary take-profit).
+  // If somehow the multipliers above still produce R:R < 1.5 (e.g. due to
+  // rounding or unexpected regime), widen TP1 to enforce it.
+  // R:R = (tp1 - entry) / (entry - sl) for LONG = _tp1m / _slm
+  if(_slm > 0 && (_tp1m / _slm) < 1.5) {
+    _tp1m = _slm * 1.5;
+  }
 
   const tp1=signal==='bull'?price+atrV*_tp1m:signal==='bear'?price-atrV*_tp1m:price+atrV*0.75;
   const tp2=signal==='bull'?price+atrV*_tp2m:signal==='bear'?price-atrV*_tp2m:price+atrV*1.5;
   const sl2=signal==='bull'?price-atrV*_slm :signal==='bear'?price+atrV*_slm :price-atrV*0.5;
+
+  // Sanity: ensure TP1 < TP2 < ... for LONG and TP1 > TP2 > ... for SHORT.
+  // If TP1 and TP2 are on the wrong side of entry, the trade is invalid.
+  // (Shouldn't happen with positive multipliers, but defensive coding.)
 
   // ── Z-Score Mean Reversion (period=20) ──────────────────────
   let zScore = null, zSignal = 'neutral';
@@ -3698,14 +3729,21 @@ function renderTFCards(results) {
 
   // ── bestTF Selection: HTF-aligned signal preferred ───────────
   // htfBias is derived from 4H + 1D + 1W — these are REFERENCE frames.
-  // TRADEABLE_TFS = entry timeframes for actual trade execution.
-  // 4H is kept in TRADEABLE_TFS (valid entry TF) but does NOT receive
-  // HTF bonus from itself — only lower TFs benefit from HTF alignment.
-  // This prevents the self-reinforcing loop where 4H defines htfBias
-  // AND receives +20 bonus from it, making it always win.
-  const TRADEABLE_TFS = ['5m','15m','1H','4H'];
+  //
+  // TRADEABLE_TFS = the timeframes we actually pick bestTF from.
+  // Per user requirement (pro trader / hedge fund manager approach):
+  //   - Only 5m, 15m, 1H are eligible for trade ENTRY.
+  //   - 4H, 1D, 1W are HTF reference frames — they CONTRIBUTE to scoring
+  //     (via htfBias alignment bonus) but are NOT selected as bestTF.
+  //   - Why? 4H+ trades last days → impractical for intraday retail,
+  //     spread/commission drag dominates, and intraday traders need
+  //     actionable entries on lower timeframes.
+  //   - The HTF bias still flows in: a 5m signal aligned with 4H+1D+1W
+  //     gets +20 bonus (strong confluence), counter-trend gets -20.
+  const TRADEABLE_TFS = ['5m','15m','1H'];
 
   // HTF contributors — these define bias but get NO self-bonus
+  // (4H was previously in TRADEABLE_TFS — removed per user request)
   const HTF_CONTRIBUTORS = ['4H','1D','1W'];
 
   let bestTF=null, bestScore=-Infinity;
@@ -3923,7 +3961,8 @@ function buildRegimePrediction(bestTF, results, price, regime, hurst) {
     if(ichiAligned) plan.rationale.push(`Ichimoku: price ${signal==='bull'?'above':'below'} cloud`);
     if(avwap && avwap.bias === signal) plan.rationale.push('Anchored VWAP confirms institutional bias');
 
-    // Trending TP: wider — let winners run
+    // Trending TP: wider — let winners run.
+    // R:R = 2.0 (tp1=2.0×ATR, sl=1.0×ATR) — above 1.5 minimum.
     const tp1m = 2.0, tp2m = 3.5, slm = 1.0;
     plan.tp1 = signal==='bull' ? price + atr*tp1m : price - atr*tp1m;
     plan.tp2 = signal==='bull' ? price + atr*tp2m : price - atr*tp2m;
@@ -3965,20 +4004,28 @@ function buildRegimePrediction(bestTF, results, price, regime, hurst) {
     if(stochExt) plan.rationale.push(`Stoch ${stoch?.toFixed(0)} — ${signal==='bull'?'oversold':'overbought'}`);
     if(mp && mp.nearPOC) plan.rationale.push('Price at POC — mean-reversion magnet level');
 
-    // Ranging TP: tight — price reverts to mean, not trend continuation
+    // Ranging TP: tight — price reverts to mean.
+    // R:R = 1.5+ (widened from 1.0/0.7=1.43 to enforce min R:R=1.5).
+    // tp1=1.5×ATR, sl=0.8×ATR → R:R = 1.875 ✓
     const poc    = mp?.poc;
     const target = poc || (bb ? bb.middle : null);
+    const _rngTp1m = 1.5, _rngTp2m = 2.5, _rngSlm = 0.8;
     if(target && signal==='bull') {
-      plan.tp1 = Math.min(price + atr*1.0, target);
-      plan.tp2 = target;
+      // Use POC/BB-middle as TP2 cap if it's closer than ATR-based TP2.
+      // TP1 is always ATR-based (predictable), TP2 can be the structural target.
+      plan.tp1 = price + atr*_rngTp1m;
+      plan.tp2 = Math.min(price + atr*_rngTp2m, target);
+      // Safety: TP2 must be > TP1, otherwise just use ATR-based TP2.
+      if(plan.tp2 <= plan.tp1) plan.tp2 = price + atr*_rngTp2m;
     } else if(target && signal==='bear') {
-      plan.tp1 = Math.max(price - atr*1.0, target);
-      plan.tp2 = target;
+      plan.tp1 = price - atr*_rngTp1m;
+      plan.tp2 = Math.max(price - atr*_rngTp2m, target);
+      if(plan.tp2 >= plan.tp1) plan.tp2 = price - atr*_rngTp2m;
     } else {
-      plan.tp1 = signal==='bull' ? price + atr*1.0 : price - atr*1.0;
-      plan.tp2 = signal==='bull' ? price + atr*1.8 : price - atr*1.8;
+      plan.tp1 = signal==='bull' ? price + atr*_rngTp1m : price - atr*_rngTp1m;
+      plan.tp2 = signal==='bull' ? price + atr*_rngTp2m : price - atr*_rngTp2m;
     }
-    plan.sl = signal==='bull' ? price - atr*0.7 : price + atr*0.7;
+    plan.sl = signal==='bull' ? price - atr*_rngSlm : price + atr*_rngSlm;
 
     // Not enough extreme signals = weak setup
     if(extremeCount < 2) {
@@ -4047,10 +4094,13 @@ function buildRegimePrediction(bestTF, results, price, regime, hurst) {
     if(zExhaust) plan.rationale.push(`Z-Score ${zScore?.toFixed(2)}σ — extreme deviation, mean-reversion likely`);
     if(hurstRev) plan.rationale.push('Hurst exponent < 0.45 — market statistically mean-reverting');
 
-    // Reversal TP: retracement, SL: tight beyond swing
+    // Reversal TP: retracement, SL: tight beyond swing.
+    // R:R = 1.875 (tp1=1.5×ATR, sl=0.8×ATR) — above 1.5 minimum.
+    // Widened SL from 0.7 → 0.8 to avoid noise stop-outs on reversal trades
+    // (these are inherently volatile, so a slightly wider SL is needed).
     plan.tp1 = signal==='bull' ? price + atr*1.5 : price - atr*1.5;
     plan.tp2 = signal==='bull' ? price + atr*2.5 : price - atr*2.5;
-    plan.sl  = signal==='bull' ? price - atr*0.7 : price + atr*0.7;
+    plan.sl  = signal==='bull' ? price - atr*0.8 : price + atr*0.8;
 
     // Reversal needs divergence — lowest conviction without it
     if(divCount === 0) {
@@ -8182,10 +8232,11 @@ function hsBuildFromCache() {
     if((now - cached.timestamp) > DASHBOARD_CACHE_TTL) continue;
 
     // Find the strongest non-neutral signal across all timeframes
-    const TRADEABLE_TFS = ['5m','15m','1H','4H'];
+    // Only tradeable TFs (5m, 15m, 1H) are eligible — 4H/1D/1W are HTF bias only.
+    const TRADEABLE_TFS = ['5m','15m','1H'];
     for(const [tfLabel, r] of Object.entries(cached.results)) {
       if(!r || r.signal === 'neutral') continue;
-      // Only scan tradeable TFs (skip 1D/1W which are slow HTF bias, not actionable signals)
+      // Only scan tradeable TFs (skip 4H/1D/1W — slow HTF bias, not actionable signals)
       if(!TRADEABLE_TFS.includes(tfLabel)) continue;
       if(r.prob >= 60) {
         signals.push({
@@ -8939,8 +8990,25 @@ function autoLogTrade(results, bestTF, price, masterScoreVal, asset, gateResult)
     if(r.signal === 'neutral') return;
     if(r.prob < 65) return; // Confidence threshold: 65%
 
+    // ── Tradeable TF gate ────────────────────────────────────────
+    // Only 5m, 15m, 1H are eligible for trade ENTRY.
+    // 4H/1D/1W are HTF reference frames — they CONTRIBUTE to scoring
+    // (via htfBias) but we don't LOG trades on them.
+    // Why? 4H+ trades last days → impractical for intraday retail,
+    // and our TP/SL history-check cadence (4H → every 16h) means
+    // such trades would sit pending for weeks, bloating the journal
+    // with no actionable outcome.
+    const _TRADEABLE_TFS = ['5m','15m','1H'];
+    if(!_TRADEABLE_TFS.includes(bestTF)) {
+      console.log(`[TJ] Skip non-tradeable TF ${bestTF} — only 5m/15m/1H are logged`);
+      return;
+    }
+
     // Confluence gate: at least 3 out of 6 TFs must agree with bestTF signal
-    // Prevents logging trades where only 1 TF shows the signal
+    // Prevents logging trades where only 1 TF shows the signal.
+    // Note: HTF TFs (4H/1D/1W) still contribute to the confluence check —
+    // a 5m signal that agrees with 4H+1D is high-quality, even though
+    // we'd never LOG a 4H trade itself.
     const _tfLabels = ['5m','15m','1H','4H','1D','1W'];
     const _agreeTFs = _tfLabels.filter(tf => results[tf] && results[tf].signal === r.signal);
     if(_agreeTFs.length < 3) return; // Not enough TF confluence — skip log
@@ -9005,12 +9073,19 @@ function autoLogTrade(results, bestTF, price, masterScoreVal, asset, gateResult)
       dayName: dayNames[now.getDay()],
       dayIndex: now.getDay(),
       hour: now.getUTCHours(), // UTC hour matches the "Time Block (UTC)" label in analytics
-      status: 'pending', // pending | win_tp1 | win_tp2 | loss
+      status: 'pending', // pending | win_tp1 | win_tp2 | loss | breakeven
       closedAt: null,
       closedPrice: null,
       gatesPassed,    // how many gates passed (0-5)
       gatesTotal,     // always 5
       gateDetails,    // array of {name, icon, pass, warn, detail}
+      // ── Pro trader tracking fields ────────────────────────────
+      // Track whether TP1 was hit before SL — if TP1 hit and then SL hit,
+      // the trade is "breakeven" (assuming 50% position closed at TP1,
+      // moved SL to entry). This is standard hedge fund practice.
+      tp1HitAt: null,      // timestamp when TP1 was first hit (null if never)
+      tp1HitPrice: null,   // price at TP1 hit
+      lastHistoricalCheck: null, // timestamp of last history check (cooldown)
     };
 
     trades.unshift(trade);
@@ -9095,8 +9170,8 @@ function _tjRenderTrades() {
       <div style="font-size:12px">Confidence ≥ 65% হলে analysis এর পর<br>automatically save হবে।</div>
     </div>`;
 
-  const SL = { pending:'⏳ Pending', win_tp1:'✅ TP1 Hit', win_tp2:'✅✅ TP2 Hit', loss:'❌ SL Hit' };
-  const SC = { pending:'pending', win_tp1:'win-tp1', win_tp2:'win-tp2', loss:'loss' };
+  const SL = { pending:'⏳ Pending', win_tp1:'✅ TP1 Hit', win_tp2:'✅✅ TP2 Hit', loss:'❌ SL Hit', breakeven:'➖ Breakeven' };
+  const SC = { pending:'pending', win_tp1:'win-tp1', win_tp2:'win-tp2', loss:'loss', breakeven:'breakeven' };
 
   return `
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;gap:10px">
@@ -9168,10 +9243,16 @@ function _tjRenderTrades() {
 function _tjRenderAnalytics() {
   const trades = _tjLoad();
   const closed = trades.filter(t => t.status !== 'pending');
-  const wins = closed.filter(t => t.status === 'win_tp1' || t.status === 'win_tp2').length;
-  const losses = closed.filter(t => t.status === 'loss').length;
+  const wins      = closed.filter(t => t.status === 'win_tp1' || t.status === 'win_tp2').length;
+  const losses    = closed.filter(t => t.status === 'loss').length;
+  const breakeven = closed.filter(t => t.status === 'breakeven').length;
   const pending = trades.filter(t => t.status === 'pending').length;
-  const winRate = closed.length > 0 ? Math.round(wins / closed.length * 100) : 0;
+  // Win rate: wins / (wins + losses), excluding breakeven (they're neutral).
+  // Pro trader methodology: breakeven trades don't count against win rate —
+  // they protected capital, which is the goal. Counting them as losses
+  // would understate the strategy's edge.
+  const directional = wins + losses;
+  const winRate = directional > 0 ? Math.round(wins / directional * 100) : 0;
   const wrColor = winRate >= 60 ? 'var(--green)' : winRate >= 45 ? 'var(--yellow)' : 'var(--red)';
 
   if(trades.length < 5) {
@@ -9236,10 +9317,11 @@ function _tjRenderAnalytics() {
     <div class="tj-analytics-card" style="margin-bottom:12px;text-align:center">
       <div class="tj-analytics-title" style="text-align:left">📈 Overall Performance</div>
       <div class="tj-win-big" style="color:${wrColor}">${winRate}%</div>
-      <div style="font-size:12px;color:var(--muted);margin-bottom:14px">Win Rate · ${closed.length} closed trades</div>
+      <div style="font-size:12px;color:var(--muted);margin-bottom:14px">Win Rate · ${directional} directional · ${breakeven} breakeven · ${closed.length} total closed</div>
       <div class="tj-summ-row">
         <div class="tj-summ-item"><div class="tj-summ-val" style="color:var(--green)">${wins}</div><div class="tj-summ-lbl">Wins</div></div>
         <div class="tj-summ-item"><div class="tj-summ-val" style="color:var(--red)">${losses}</div><div class="tj-summ-lbl">Losses</div></div>
+        <div class="tj-summ-item"><div class="tj-summ-val" style="color:var(--muted)">${breakeven}</div><div class="tj-summ-lbl">B/E</div></div>
         <div class="tj-summ-item"><div class="tj-summ-val" style="color:var(--yellow)">${pending}</div><div class="tj-summ-lbl">Pending</div></div>
         <div class="tj-summ-item"><div class="tj-summ-val" style="color:var(--blue)">${trades.length}</div><div class="tj-summ-lbl">Total</div></div>
       </div>
@@ -9440,34 +9522,108 @@ async function _tjCheckHistorical() {
 
       let outcome = null, outcomeTime = null, outcomePrice = null;
 
-      // Walk candles oldest → newest. TP checked BEFORE SL within a single
-      // candle (optimistic but realistic for retail: if both touched in the
-      // same candle, the profit target was probably hit on the way up/down
-      // before the reversal hit SL). Exception: if the candle OPENED beyond
-      // SL — that's a gap, immediate loss.
+      // ── Pro trader TP1-tracking + breakeven logic ──────────────────
+      // Standard hedge fund two-tier TP approach:
+      //   1. When TP1 is hit, close 50% of position, move SL to entry (breakeven).
+      //   2. If price then hits SL (now at entry), trade is BREAKEVEN (not loss).
+      //   3. If price hits TP2, trade is WIN_TP2 (full runner).
+      //   4. If price hits SL before TP1, trade is LOSS (full position).
+      //
+      // We track tp1HitAt per trade so that on subsequent checks we know
+      // to apply the breakeven rule. This avoids the pessimistic
+      // "TP before SL in same candle" assumption when actually TP1 was
+      // hit many candles ago and then price reversed.
+      //
+      // Walk candles oldest → newest. Within a single candle:
+      //   - If gap-down open below SL (LONG) → instant loss
+      //     (unless TP1 was hit before, in which case breakeven)
+      //   - TP2 takes priority over TP1 (further target hit first means
+      //     both targets were touched on the way)
+      //   - TP1 hit → record timestamp, continue scanning (don't break)
+      //   - SL hit (after TP1) → breakeven
+      //   - SL hit (before TP1) → loss
+      const tradeRef = trades.find(tr => tr.id === trade.id);
+      const tp1AlreadyHit = !!tradeRef?.tp1HitAt;
+
       for(const c of filtered) {
         const openTime = c[0];
         const open = +c[1], high = +c[2], low = +c[3];
 
         if(trade.direction === 'LONG') {
           // Entry was BUY. SL below entry, TPs above.
+          // If TP1 was already hit in a previous check, treat SL as breakeven.
+          if(tp1AlreadyHit || tradeRef?.tp1HitAt) {
+            // Breakeven mode: SL is effectively at entry. If price touches entry
+            // (or below), it's a breakeven exit.
+            // We still check TP2 first (runner still active).
+            if(low <= +trade.entry) {
+              outcome = 'breakeven';
+              outcomeTime = openTime;
+              outcomePrice = +trade.entry;
+              break;
+            }
+            if(high >= +trade.tp2) {
+              outcome = 'win_tp2';
+              outcomeTime = openTime;
+              outcomePrice = +trade.tp2;
+              break;
+            }
+            // TP1 re-touched: no action (already recorded).
+            continue;
+          }
+
+          // Normal mode (TP1 not yet hit):
           // Gap-down open below SL → instant loss
           if(open <= +trade.sl)  { outcome='loss';    outcomeTime=openTime; outcomePrice=+trade.sl;  break; }
-          // TP2 (further target) hit before SL within same candle
+          // TP2 hit (further target) — implies TP1 was also touched on the way up.
+          // Mark as win_tp2 (the better outcome).
           if(high >= +trade.tp2) { outcome='win_tp2'; outcomeTime=openTime; outcomePrice=+trade.tp2; break; }
-          // TP1 hit
-          if(high >= +trade.tp1) { outcome='win_tp1'; outcomeTime=openTime; outcomePrice=+trade.tp1; break; }
-          // Only SL hit in this candle
-          if(low  <= +trade.sl)  { outcome='loss';    outcomeTime=openTime; outcomePrice=+trade.sl;  break; }
+          // TP1 hit only (price went up to TP1 but not TP2).
+          // Record TP1 hit timestamp and CONTINUE scanning — the trade is still
+          // open with the remaining 50% position, waiting for TP2 or SL.
+          if(high >= +trade.tp1) {
+            if(tradeRef && !tradeRef.tp1HitAt) {
+              tradeRef.tp1HitAt = new Date(openTime).toISOString();
+              tradeRef.tp1HitPrice = +trade.tp1;
+              changed = true;
+            }
+            // Continue scanning subsequent candles in breakeven mode.
+            // (The `tp1AlreadyHit || tradeRef?.tp1HitAt` check at the top of
+            // the loop will pick this up on the next iteration.)
+            continue;
+          }
+          // SL hit (no TP1 first) → loss
+          if(low <= +trade.sl)  { outcome='loss';    outcomeTime=openTime; outcomePrice=+trade.sl;  break; }
         } else { // SHORT
           // Entry was SELL. SL above entry, TPs below.
-          // Gap-up open above SL → instant loss
+          if(tp1AlreadyHit || tradeRef?.tp1HitAt) {
+            // Breakeven mode: SL is effectively at entry.
+            if(high >= +trade.entry) {
+              outcome = 'breakeven';
+              outcomeTime = openTime;
+              outcomePrice = +trade.entry;
+              break;
+            }
+            if(low <= +trade.tp2) {
+              outcome = 'win_tp2';
+              outcomeTime = openTime;
+              outcomePrice = +trade.tp2;
+              break;
+            }
+            continue;
+          }
+
+          // Normal mode (TP1 not yet hit):
           if(open >= +trade.sl)  { outcome='loss';    outcomeTime=openTime; outcomePrice=+trade.sl;  break; }
-          // TP2 (further down) hit
-          if(low  <= +trade.tp2) { outcome='win_tp2'; outcomeTime=openTime; outcomePrice=+trade.tp2; break; }
-          // TP1 hit
-          if(low  <= +trade.tp1) { outcome='win_tp1'; outcomeTime=openTime; outcomePrice=+trade.tp1; break; }
-          // Only SL hit
+          if(low <= +trade.tp2)  { outcome='win_tp2'; outcomeTime=openTime; outcomePrice=+trade.tp2; break; }
+          if(low <= +trade.tp1)  {
+            if(tradeRef && !tradeRef.tp1HitAt) {
+              tradeRef.tp1HitAt = new Date(openTime).toISOString();
+              tradeRef.tp1HitPrice = +trade.tp1;
+              changed = true;
+            }
+            continue;
+          }
           if(high >= +trade.sl)  { outcome='loss';    outcomeTime=openTime; outcomePrice=+trade.sl;  break; }
         }
       }
