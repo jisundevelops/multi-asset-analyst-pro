@@ -3692,15 +3692,28 @@ function renderTFCards(results) {
   }
 
   // ── bestTF Selection: HTF-aligned signal preferred ───────────
-  // Score = prob + HTF alignment bonus (20pts if aligned, -20pts if counter)
+  // htfBias is derived from 4H + 1D + 1W — these are REFERENCE frames.
+  // TRADEABLE_TFS = entry timeframes for actual trade execution.
+  // 4H is kept in TRADEABLE_TFS (valid entry TF) but does NOT receive
+  // HTF bonus from itself — only lower TFs benefit from HTF alignment.
+  // This prevents the self-reinforcing loop where 4H defines htfBias
+  // AND receives +20 bonus from it, making it always win.
   const TRADEABLE_TFS = ['5m','15m','1H','4H'];
+
+  // HTF contributors — these define bias but get NO self-bonus
+  const HTF_CONTRIBUTORS = ['4H','1D','1W'];
+
   let bestTF=null, bestScore=-Infinity;
   for(const [tf,r] of Object.entries(results)){
     if(!TRADEABLE_TFS.includes(tf)) continue;
     if(r.signal==='neutral') continue; // skip neutral — no direction
-    const htfBonus = htfBias === 'neutral' ? 0
-                   : r.signal === htfBias   ? 20   // aligned with HTF → bonus
-                   :                         -20;  // counter-trend → penalty
+    // 4H contributed to htfBias — no self-bonus, but also no penalty
+    // Lower TFs (5m, 15m, 1H) get full ±20 alignment bonus
+    const isHTFContributor = HTF_CONTRIBUTORS.includes(tf);
+    const htfBonus = isHTFContributor ? 0
+                   : htfBias === 'neutral' ? 0
+                   : r.signal === htfBias   ? 20   // LTF aligned with HTF → bonus
+                   :                         -20;  // LTF counter-trend → penalty
     const adjustedScore = r.prob + htfBonus;
     if(adjustedScore > bestScore){ bestScore = adjustedScore; bestTF = tf; }
   }
