@@ -3864,32 +3864,333 @@ function renderBestRec(bestTF, results, marketStructureLine) {
     </div>`);
 }
 
+// ── Regime-Based Prediction Engine ──────────────────────────────
+// Returns a complete regime-specific trade plan with:
+//   strategy, confidence, entry rationale, key indicators, TP/SL, warnings
+function buildRegimePrediction(bestTF, results, price, regime, hurst) {
+  const r = results[bestTF];
+  if(!r || !price) return null;
+
+  const signal  = r.signal;
+  const atr     = +r.atr || price * 0.015;
+  const adx     = r.adx;
+  const macd    = r.macd;
+  const rsi     = r.rsi !== null ? +r.rsi : null;
+  const stoch   = r.stoch !== null ? +r.stoch : null;
+  const zScore  = r.zScore;
+  const bb      = r.bb;
+  const mp      = r.marketProfile;
+  const avwap   = r.avwap;
+  const ichi    = r.ichimoku;
+  const squeeze = r.squeeze;
+  const vol     = r.volumeTrend;
+  const reg     = regime || r.regime || 'RANGING';
+
+  // ── Hurst overlay: override regime if Hurst strongly disagrees ──
+  let effectiveRegime = reg;
+  if(hurst) {
+    if(hurst.regime === 'mean_reverting' && reg === 'TRENDING') effectiveRegime = 'RANGING';
+    if(hurst.regime === 'trending'       && reg === 'RANGING')  effectiveRegime = 'TRENDING';
+  }
+
+  let plan = {
+    regime:        effectiveRegime,
+    strategy:      '',
+    direction:     signal,
+    confidence:    r.prob,
+    entry:         price,
+    tp1:           +r.tp1,
+    tp2:           +r.tp2,
+    sl:            +r.sl,
+    rationale:     [],
+    warnings:      [],
+    keyIndicators: [],
+    tradeable:     true,
+  };
+
+  // ════════════════════════════════════════
+  //  TRENDING — Trend-following strategy
+  // ════════════════════════════════════════
+  if(effectiveRegime === 'TRENDING') {
+    plan.strategy = '📈 Trend-Following';
+
+    // Key indicators for trending
+    plan.keyIndicators = ['ADX', 'EMA 21', 'MACD', 'Supertrend', 'Ichimoku'];
+
+    // Check trend alignment
+    const adxStrong  = adx && adx.adx > 25;
+    const emaAbove   = r.ema21 && price > +r.ema21;
+    const macdAligned = macd && (signal==='bull' ? macd.positive : !macd.positive);
+    const ichiAligned = ichi && ichi.signal === signal;
+
+    // Rationale
+    if(adxStrong) plan.rationale.push(`ADX ${adx.adx.toFixed(0)} — strong trend confirmed`);
+    if(macdAligned) plan.rationale.push(`MACD ${signal==='bull'?'above':'below'} signal line`);
+    if(ichiAligned) plan.rationale.push(`Ichimoku: price ${signal==='bull'?'above':'below'} cloud`);
+    if(avwap && avwap.bias === signal) plan.rationale.push('Anchored VWAP confirms institutional bias');
+
+    // Trending TP: wider — let winners run
+    const tp1m = 2.0, tp2m = 3.5, slm = 1.0;
+    plan.tp1 = signal==='bull' ? price + atr*tp1m : price - atr*tp1m;
+    plan.tp2 = signal==='bull' ? price + atr*tp2m : price - atr*tp2m;
+    plan.sl  = signal==='bull' ? price - atr*slm  : price + atr*slm;
+
+    // Entry tip: wait for pullback to EMA
+    if(signal==='bull' && r.ema21 && price > +r.ema21 * 1.015)
+      plan.warnings.push('Price extended above EMA21 — wait for pullback to EMA for better entry');
+    if(signal==='bear' && r.ema21 && price < +r.ema21 * 0.985)
+      plan.warnings.push('Price extended below EMA21 — wait for bounce to EMA for better short entry');
+
+    // RSI warning — in trending, RSI overbought is NORMAL
+    if(rsi && signal==='bull' && rsi > 70)
+      plan.rationale.push(`RSI ${rsi.toFixed(0)} — overbought but normal in strong uptrend`);
+
+    // ADX not confirming
+    if(!adxStrong)
+      plan.warnings.push('ADX < 25 — trend strength weak, reduce position size');
+
+  // ════════════════════════════════════════
+  //  RANGING — Mean-reversion strategy
+  // ════════════════════════════════════════
+  } else if(effectiveRegime === 'RANGING') {
+    plan.strategy = '↔️ Mean-Reversion';
+    plan.keyIndicators = ['RSI', 'Stochastic', 'Bollinger Bands', 'Z-Score', 'Williams %R', 'POC'];
+
+    const bbPos = bb ? (price - bb.lower) / (bb.upper - bb.lower) : 0.5;
+    const atExtreme = signal==='bull' ? bbPos < 0.2 : bbPos > 0.8;
+    const rsiExtreme = rsi ? (signal==='bull' ? rsi < 35 : rsi > 65) : false;
+    const zExtreme   = zScore ? Math.abs(zScore) > 1.5 : false;
+    const stochExt   = stoch  ? (signal==='bull' ? stoch < 25 : stoch > 75) : false;
+
+    // In ranging, need oscillator confluence
+    const extremeCount = [atExtreme, rsiExtreme, zExtreme, stochExt].filter(Boolean).length;
+
+    if(atExtreme) plan.rationale.push(`BB position: ${signal==='bull'?'near lower band (oversold zone)':'near upper band (overbought zone)'}`);
+    if(rsiExtreme) plan.rationale.push(`RSI ${rsi?.toFixed(0)} — ${signal==='bull'?'oversold':'overbought'}`);
+    if(zExtreme) plan.rationale.push(`Z-Score ${zScore?.toFixed(2)}σ — ${Math.abs(zScore)>2?'extreme':'elevated'} deviation from mean`);
+    if(stochExt) plan.rationale.push(`Stoch ${stoch?.toFixed(0)} — ${signal==='bull'?'oversold':'overbought'}`);
+    if(mp && mp.nearPOC) plan.rationale.push('Price at POC — mean-reversion magnet level');
+
+    // Ranging TP: tight — price reverts to mean, not trend continuation
+    const poc    = mp?.poc;
+    const target = poc || (bb ? bb.middle : null);
+    if(target && signal==='bull') {
+      plan.tp1 = Math.min(price + atr*1.0, target);
+      plan.tp2 = target;
+    } else if(target && signal==='bear') {
+      plan.tp1 = Math.max(price - atr*1.0, target);
+      plan.tp2 = target;
+    } else {
+      plan.tp1 = signal==='bull' ? price + atr*1.0 : price - atr*1.0;
+      plan.tp2 = signal==='bull' ? price + atr*1.8 : price - atr*1.8;
+    }
+    plan.sl = signal==='bull' ? price - atr*0.7 : price + atr*0.7;
+
+    // Not enough extreme signals = weak setup
+    if(extremeCount < 2) {
+      plan.warnings.push('Only ' + extremeCount + '/4 oscillators at extreme — weak mean-reversion setup, wait for better entry');
+      if(extremeCount === 0) plan.tradeable = false;
+    }
+    // Trending MA against — don't fade a strong trend
+    if(r.ema21 && r.sma50) {
+      const trendy = signal==='bull' ? (+r.ema21 < +r.sma50) : (+r.ema21 > +r.sma50);
+      if(trendy) plan.warnings.push('EMA21 vs SMA50 shows contrary trend — fading strong trend is risky');
+    }
+
+  // ════════════════════════════════════════
+  //  BREAKOUT — Momentum strategy
+  // ════════════════════════════════════════
+  } else if(effectiveRegime === 'BREAKOUT') {
+    plan.strategy = '🚀 Breakout-Momentum';
+    plan.keyIndicators = ['Volume', 'BB Squeeze', 'MACD Cross', 'ATR Expansion', 'Anchored VWAP'];
+
+    const volSpike   = vol && vol > 1.5;
+    const sqBreak    = squeeze && !squeeze.squeezing;
+    const macdCross  = macd && (signal==='bull' ? (macd.positive && macd.histRising) : (!macd.positive && !macd.histRising));
+    const avwapBreak = avwap && avwap.bias === signal;
+
+    if(volSpike) plan.rationale.push(`Volume ${(vol*100).toFixed(0)}% of average — institutional participation confirmed`);
+    if(sqBreak)  plan.rationale.push('BB Squeeze released — coiled energy breakout');
+    if(macdCross) plan.rationale.push(`MACD ${signal==='bull'?'bullish':'bearish'} with histogram ${signal==='bull'?'rising':'falling'}`);
+    if(avwapBreak) plan.rationale.push('Price broke above Anchored VWAP — institutional bias confirmed');
+    if(mp && mp.aboveVAH && signal==='bull') plan.rationale.push('Price above Value Area High — bullish breakout from range');
+    if(mp && mp.belowVAL && signal==='bear') plan.rationale.push('Price below Value Area Low — bearish breakdown from range');
+
+    // Breakout TP: measured move
+    plan.tp1 = signal==='bull' ? price + atr*2.5 : price - atr*2.5;
+    plan.tp2 = signal==='bull' ? price + atr*4.0 : price - atr*4.0;
+    plan.sl  = signal==='bull' ? price - atr*1.2 : price + atr*1.2;
+
+    // MANDATORY: volume confirmation
+    if(!volSpike) {
+      plan.warnings.push('⚠️ No volume spike — breakout without volume = high false breakout risk');
+      plan.tradeable = false;
+    }
+    if(!sqBreak && !macdCross)
+      plan.warnings.push('No squeeze break or MACD cross — wait for momentum confirmation');
+
+  // ════════════════════════════════════════
+  //  REVERSAL — Counter-trend strategy
+  // ════════════════════════════════════════
+  } else if(effectiveRegime === 'REVERSAL') {
+    plan.strategy = '🔄 Counter-Trend Reversal';
+    plan.keyIndicators = ['RSI Divergence', 'MACD Divergence', 'Exhaustion Candles', 'Z-Score', 'Hurst'];
+
+    const rsiDiv  = r.rsiDiv  || 'none';
+    const macdDiv = r.macdDiv || 'none';
+    const rsiExhaust = rsi ? (signal==='bull' ? rsi < 28 : rsi > 72) : false;
+    const zExhaust   = zScore ? (signal==='bull' ? zScore < -2.0 : zScore > 2.0) : false;
+    const hurstRev   = hurst && hurst.regime === 'mean_reverting';
+
+    const divCount = [
+      rsiDiv === (signal==='bull'?'bullish':'bearish'),
+      macdDiv === (signal==='bull'?'bullish':'bearish'),
+    ].filter(Boolean).length;
+
+    if(rsiDiv !== 'none') plan.rationale.push(`RSI ${rsiDiv} divergence detected`);
+    if(macdDiv !== 'none') plan.rationale.push(`MACD ${macdDiv} divergence detected`);
+    if(rsiExhaust) plan.rationale.push(`RSI ${rsi?.toFixed(0)} — price exhaustion level`);
+    if(zExhaust) plan.rationale.push(`Z-Score ${zScore?.toFixed(2)}σ — extreme deviation, mean-reversion likely`);
+    if(hurstRev) plan.rationale.push('Hurst exponent < 0.45 — market statistically mean-reverting');
+
+    // Reversal TP: retracement, SL: tight beyond swing
+    plan.tp1 = signal==='bull' ? price + atr*1.5 : price - atr*1.5;
+    plan.tp2 = signal==='bull' ? price + atr*2.5 : price - atr*2.5;
+    plan.sl  = signal==='bull' ? price - atr*0.7 : price + atr*0.7;
+
+    // Reversal needs divergence — lowest conviction without it
+    if(divCount === 0) {
+      plan.warnings.push('No RSI or MACD divergence — reversal signal weak, avoid or reduce size by 50%');
+      plan.tradeable = false;
+    }
+    if(divCount === 1)
+      plan.warnings.push('Single divergence — wait for second confirmation before entry');
+
+    plan.warnings.push('Counter-trend trade: always use smaller position size (50% of normal)');
+  }
+
+  // ── Universal confidence adjustment ──────────────────────────
+  // HTF bias check
+  const htfBias = results._htfBias || 'neutral';
+  if(htfBias !== 'neutral' && htfBias !== signal) {
+    plan.confidence = Math.round(plan.confidence * 0.75);
+    plan.warnings.push('Counter-trend vs HTF bias — confidence reduced');
+  }
+
+  // R:R calculation
+  const risk   = Math.abs(plan.sl  - plan.entry);
+  const reward = Math.abs(plan.tp1 - plan.entry);
+  plan.rr = risk > 0 ? +(reward / risk).toFixed(2) : 0;
+  if(plan.rr < 1.2) {
+    plan.warnings.push(`R:R ${plan.rr} is below 1.2 — unfavorable setup`);
+    plan.tradeable = false;
+  }
+
+  return plan;
+}
+
 function renderTPSL(bestTF, results, price) {
-  const r=results[bestTF];
-  if(!r){setHTML('tpslPanel','<div style="color:var(--muted);font-size:12px">Insufficient data for trade setup</div>');return;}
-  const sL=r.signal==='bull'?'▲ LONG':r.signal==='bear'?'▼ SHORT':'◆ NEUTRAL';
-  const tp1v=+r.tp1, tp2v=+r.tp2, slv=+r.sl;
-  const p1=((tp1v-price)/price*100).toFixed(2);
-  const p2=((tp2v-price)/price*100).toFixed(2);
-  const ps=((slv-price)/price*100).toFixed(2);
-  const rr=(slv!==price?Math.abs((tp1v-price)/(slv-price)):0).toFixed(2);
-  setHTML('tpslPanel',`
+  const r = results[bestTF];
+  if(!r){ setHTML('tpslPanel','<div style="color:var(--muted);font-size:12px">Insufficient data for trade setup</div>'); return; }
+
+  // Build regime-based prediction plan
+  const bestRegime = r.regime || 'RANGING';
+  const bestHurst  = r.hurst  || null;
+  const plan = buildRegimePrediction(bestTF, results, price, bestRegime, bestHurst);
+
+  if(!plan){ setHTML('tpslPanel','<div style="color:var(--muted);font-size:12px">Unable to build trade plan</div>'); return; }
+
+  const sL     = plan.direction==='bull' ? '▲ LONG' : plan.direction==='bear' ? '▼ SHORT' : '◆ NEUTRAL';
+  const dirCol = plan.direction==='bull' ? 'var(--green)' : plan.direction==='bear' ? 'var(--red)' : 'var(--yellow)';
+  const p1  = ((plan.tp1 - price) / price * 100).toFixed(2);
+  const p2  = ((plan.tp2 - price) / price * 100).toFixed(2);
+  const ps  = ((plan.sl  - price) / price * 100).toFixed(2);
+
+  // Regime badge color
+  const regColors = { TRENDING:'#3d8eff', RANGING:'#a855f7', BREAKOUT:'#f7931a', REVERSAL:'#ff2d55' };
+  const regCol  = regColors[plan.regime] || 'var(--muted)';
+
+  // Tradeable badge
+  const tradeableBadge = plan.tradeable
+    ? '<span style="font-size:10px;padding:3px 8px;border-radius:5px;font-weight:700;background:rgba(5,229,122,.12);color:var(--green);border:1px solid rgba(5,229,122,.3)">✅ Tradeable</span>'
+    : '<span style="font-size:10px;padding:3px 8px;border-radius:5px;font-weight:700;background:rgba(255,45,85,.1);color:var(--red);border:1px solid rgba(255,45,85,.3)">⛔ Conditions Not Met</span>';
+
+  // Rationale bullets
+  const rationaleHTML = plan.rationale.length > 0
+    ? plan.rationale.map(r => `<div style="font-size:10px;color:var(--dim);margin-bottom:2px">• ${r}</div>`).join('')
+    : '<div style="font-size:10px;color:var(--muted)">No strong rationale — weak setup</div>';
+
+  // Warning bullets
+  const warningsHTML = plan.warnings.length > 0
+    ? '<div style="margin-top:8px;padding:8px 10px;background:rgba(255,195,0,.06);border:1px solid rgba(255,195,0,.2);border-radius:7px">'
+      + plan.warnings.map(w => `<div style="font-size:10px;color:var(--yellow);margin-bottom:2px">⚠️ ${w}</div>`).join('')
+      + '</div>'
+    : '';
+
+  setHTML('tpslPanel', `
     <div class="tpsl-header">
-      <div class="tpsl-title">🎯 Trade Setup — ${bestTF} Timeframe</div>
-      <div class="signal-badge ${r.signal}">${sL}</div>
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+        <div class="tpsl-title">🎯 Trade Setup — ${bestTF}</div>
+        <span style="font-size:10px;padding:3px 8px;border-radius:5px;font-weight:700;
+          background:${regCol}22;color:${regCol};border:1px solid ${regCol}55">
+          ${plan.strategy}
+        </span>
+        ${tradeableBadge}
+      </div>
+      <div class="signal-badge ${plan.direction}">${sL}</div>
     </div>
+
     <div class="tpsl-grid">
-      <div class="tpsl-box entry"><div class="tpsl-label">Entry Zone</div><div class="tpsl-price entry">${fmtPrice(price)}</div><div class="tpsl-pct">Current Price</div></div>
-      <div class="tpsl-box tp1"><div class="tpsl-label">Take Profit 1</div><div class="tpsl-price tp">${fmtPrice(r.tp1)}</div><div class="tpsl-pct" style="color:var(--green)">${p1>0?'+':''}${p1}%</div></div>
-      <div class="tpsl-box tp2"><div class="tpsl-label">Take Profit 2</div><div class="tpsl-price tp">${fmtPrice(r.tp2)}</div><div class="tpsl-pct" style="color:var(--green)">${p2>0?'+':''}${p2}%</div></div>
-      <div class="tpsl-box sl"><div class="tpsl-label">Stop Loss</div><div class="tpsl-price sl">${fmtPrice(r.sl)}</div><div class="tpsl-pct" style="color:var(--red)">${r.signal==='bear' ? '+' : '-'}${Math.abs(ps)}%</div></div>
+      <div class="tpsl-box entry">
+        <div class="tpsl-label">Entry Zone</div>
+        <div class="tpsl-price entry">${fmtPrice(price)}</div>
+        <div class="tpsl-pct">Current Price</div>
+      </div>
+      <div class="tpsl-box tp1">
+        <div class="tpsl-label">Take Profit 1</div>
+        <div class="tpsl-price tp">${fmtPrice(smartToFixed(plan.tp1))}</div>
+        <div class="tpsl-pct" style="color:var(--green)">${+p1>0?'+':''}${p1}%</div>
+      </div>
+      <div class="tpsl-box tp2">
+        <div class="tpsl-label">Take Profit 2</div>
+        <div class="tpsl-price tp">${fmtPrice(smartToFixed(plan.tp2))}</div>
+        <div class="tpsl-pct" style="color:var(--green)">${+p2>0?'+':''}${p2}%</div>
+      </div>
+      <div class="tpsl-box sl">
+        <div class="tpsl-label">Stop Loss</div>
+        <div class="tpsl-price sl">${fmtPrice(smartToFixed(plan.sl))}</div>
+        <div class="tpsl-pct" style="color:var(--red)">${plan.direction==='bear'?'+':'-'}${Math.abs(ps)}%</div>
+      </div>
     </div>
+
     <div class="prob-display">
-      <div class="prob-item"><div class="prob-item-val" style="color:var(--green)">${r.bullPct}%</div><div class="prob-item-label">📈 Bullish</div></div>
-      <div class="prob-item"><div class="prob-item-val" style="color:var(--red)">${r.bearPct}%</div><div class="prob-item-label">📉 Bearish</div></div>
-      <div class="prob-item"><div class="prob-item-val" style="color:var(--yellow)">${rr}:1</div><div class="prob-item-label">⚖️ Risk/Reward</div></div>
-      <div class="prob-item"><div class="prob-item-val" style="color:var(--cyan)">${bestTF}</div><div class="prob-item-label">⏱ Best TF</div></div>
-    </div>`);
+      <div class="prob-item">
+        <div class="prob-item-val" style="color:var(--green)">${r.bullPct}%</div>
+        <div class="prob-item-label">📈 Bullish</div>
+      </div>
+      <div class="prob-item">
+        <div class="prob-item-val" style="color:var(--red)">${r.bearPct}%</div>
+        <div class="prob-item-label">📉 Bearish</div>
+      </div>
+      <div class="prob-item">
+        <div class="prob-item-val" style="color:var(--yellow)">${plan.rr}:1</div>
+        <div class="prob-item-label">⚖️ R:R</div>
+      </div>
+      <div class="prob-item">
+        <div class="prob-item-val" style="color:${regCol}">${plan.regime}</div>
+        <div class="prob-item-label">📊 Regime</div>
+      </div>
+    </div>
+
+    <div style="margin-top:10px;padding:10px 12px;background:var(--bg3);border:1px solid var(--border);border-radius:8px">
+      <div style="font-size:10px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:1px;margin-bottom:6px">
+        ${plan.strategy} — Why This Trade
+      </div>
+      ${rationaleHTML}
+    </div>
+
+    ${warningsHTML}
+  `);
 }
 
 function renderIndicators(bestTF, results, price) {
