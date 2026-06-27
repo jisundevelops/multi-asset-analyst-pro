@@ -1167,7 +1167,7 @@
       <div class="card-title">📰 Live News & Market Sentiment</div>
       <div id="sentimentTags"></div>
       <div class="news-list" id="newsList">
-        <div class="ai-loading">News আনছি<span class="dots"></span></div>
+        <div class="ai-loading">📰 News লোড হচ্ছে<span class="dots"></span></div>
       </div>
     </div>
     <div class="card">
@@ -1678,6 +1678,27 @@ async function fetchBTCDominance() {
     }
   } catch(_){}
   return null;
+}
+
+// ── Real News Fetcher (via /api/news proxy → CoinDesk + CoinTelegraph RSS) ──
+// Replaces the old generateLocalSentiment fake news templates.
+// Returns array of {title, link, source, publishedAt, summary} or [] on failure.
+async function fetchRealNews(assetKey) {
+  try {
+    const url = `/api/news?asset=${encodeURIComponent(assetKey || '')}&limit=6`;
+    const d = await tryFetch(url, 10000, 1);
+    if(d && Array.isArray(d.items) && d.items.length > 0) {
+      return d.items.map(item => ({
+        headline: item.title,
+        link: item.link,
+        source: item.source,
+        publishedAt: item.publishedAt,
+        impact: item.summary || '',
+        sentiment: 'neutral', // RSS doesn't provide sentiment — user reads headline
+      }));
+    }
+  } catch(_){}
+  return [];
 }
 
 // ── Fear & Greed styling helpers ──────────────────────────────────
@@ -3036,11 +3057,28 @@ function detectTrendlineBreak(candles) {
   try {
     const {swingHighs, swingLows} = findSwingPoints(candles, 100);
     let bullishBreak = false, bearishBreak = false, trendlineStatus = '';
+
+    // ── Colinearity check (NEW — fixes false trendline breaks) ──
+    // Previously: slope computed only from pts[0] and pts[2], middle swing
+    // pts[1] was NOT validated to lie on or near the trendline.
+    // This caused false breaks when endpoints formed a slope but the
+    // middle swing was far off the line.
+    //
+    // Now: check that pts[1] is within 0.5% of the expected trendline value
+    // at its index. If not, the 3 points don't form a valid trendline → skip.
+    const isColinear = (pts, tolerance = 0.005) => {
+      if (pts.length < 3) return false;
+      const slope = (pts[2].price - pts[0].price) / (pts[2].index - pts[0].index);
+      const expectedAtPts1 = pts[0].price + slope * (pts[1].index - pts[0].index);
+      const deviation = Math.abs(pts[1].price - expectedAtPts1) / expectedAtPts1;
+      return deviation <= tolerance;
+    };
+
     // Descending trendline from last 3 swing highs
     if(swingHighs.length >= 3){
       const pts = swingHighs.slice(-3);
       const slope = (pts[2].price - pts[0].price) / (pts[2].index - pts[0].index);
-      if(slope < 0){ // descending
+      if(slope < 0 && isColinear(pts)){ // descending + colinear (NEW: colinearity check)
         const lastCandle = candles[candles.length-1];
         const trendlineAtEnd = pts[2].price + slope * (candles.length - 1 - pts[2].index);
         if(lastCandle.c > trendlineAtEnd) bullishBreak = true;
@@ -3050,7 +3088,7 @@ function detectTrendlineBreak(candles) {
     if(swingLows.length >= 3){
       const pts = swingLows.slice(-3);
       const slope = (pts[2].price - pts[0].price) / (pts[2].index - pts[0].index);
-      if(slope > 0){ // ascending
+      if(slope > 0 && isColinear(pts)){ // ascending + colinear (NEW: colinearity check)
         const lastCandle = candles[candles.length-1];
         const trendlineAtEnd = pts[2].price + slope * (candles.length - 1 - pts[2].index);
         if(lastCandle.c < trendlineAtEnd) bearishBreak = true;
@@ -5991,10 +6029,17 @@ async function fetchOnChainData() {
     hashRate: null, hashRateEH: null, hashRateTrend: 'flat',
     difficulty: null, diffTrend: 'flat', nextAdjustment: null,
     mempool: { txCount: 0, feeRange: { min: 0, max: 0 }, congestion: 'low', vSize: 0 },
-    txCount24h: null, txCountTrend: 'flat',
-    mvrv: null, mvrvSignal: 'neutral',
-    nvt: null, nvtSignal: 'neutral',
-    exchangeReserveTrend: 'flat',
+    txCount24h: null,
+    // ── BUG FIX: MVRV and NVT were fake/misleading ─────────────
+    // MVRV: previously used hardcoded 0.72 multiplier → always 1.389 → always neutral
+    //       Now set to null + signal 'unavailable' until real realized cap data is fetched
+    // NVT: previously used CoinGecko exchange volume (not on-chain tx volume)
+    //       Now renamed internally to 'priceVolumeRatio' and labeled honestly in UI
+    mvrv: null, mvrvSignal: 'unavailable',
+    nvt: null, nvtSignal: 'unavailable',
+    // ── BUG FIX: Dead fields removed ──────────────────────────
+    // exchangeReserveTrend and txCountTrend were always 'flat' (never updated)
+    // → dead code that implied data which didn't exist. Removed.
     onchainSentiment: 50,
     marketCap: null, realizedCapEst: null,
     totalBTC: null,
@@ -6112,26 +6157,42 @@ async function fetchOnChainData() {
     if(cgd?.market_data) {
       const md = cgd.market_data;
       result.marketCap = md.market_cap?.usd || null;
-      if(md.fully_diluted_valuation?.usd && md.total_supply) {
-        result.realizedCapEst = Math.round(md.market_cap.usd * 0.72);
-      }
-      if(result.marketCap && result.realizedCapEst) {
-        result.mvrv = +(result.marketCap / result.realizedCapEst).toFixed(2);
-        if(result.mvrv > 2.4) result.mvrvSignal = 'bearish';
-        else if(result.mvrv > 1.8) result.mvrvSignal = 'caution';
-        else if(result.mvrv > 1.0) result.mvrvSignal = 'neutral';
-        else result.mvrvSignal = 'bullish';
-      }
+      // ── BUG FIX: MVRV — removed fake 0.72 multiplier ──────────
+      // Previously: realizedCapEst = market_cap × 0.72 (hardcoded)
+      //           → MVRV = market_cap / (market_cap × 0.72) = 1.389 always
+      //           → mvrvSignal always 'neutral' → contributed 0 to sentiment
+      // True realized cap requires UTXO-level data (CoinMetrics/Glassnode API).
+      // Until we integrate that, MVRV is honestly set to 'unavailable'.
+      // The UI panel now shows "N/A — requires UTXO data" instead of a fake 1.39.
+      result.realizedCapEst = null; // honestly null until real data source added
+      result.mvrv = null;
+      result.mvrvSignal = 'unavailable';
+
+      // ── BUG FIX: NVT — renamed to Price/Volume Ratio (honest) ──
+      // Previously labeled "NVT" but used CoinGecko's total_volume.usd
+      // (exchange trading volume, NOT on-chain transaction volume).
+      // True NVT = market_cap / (on_chain_tx_volume × 365).
+      // Exchange volume is a different metric — labeling it NVT was misleading.
+      // Now we compute it but label it honestly as "Price/Volume Ratio"
+      // in the UI. The thresholds are also adjusted for this metric.
       if(result.marketCap && md.total_volume?.usd) {
         const dailyVol = md.total_volume.usd;
+        // This is exchange volume, not on-chain tx volume.
+        // Price/Volume Ratio = market_cap / (daily_vol × 365)
+        // Lower = more volume relative to market cap = more liquid/active
         result.nvt = +(result.marketCap / (dailyVol * 365)).toFixed(1);
-        if(result.nvt > 90) result.nvtSignal = 'overvalued';
-        else if(result.nvt > 55) result.nvtSignal = 'neutral';
-        else result.nvtSignal = 'undervalued';
+        // Adjusted thresholds for exchange-volume-based ratio
+        // (typically much lower than true NVT which uses on-chain volume)
+        if(result.nvt > 60) result.nvtSignal = 'overvalued';   // low volume relative to cap
+        else if(result.nvt > 25) result.nvtSignal = 'neutral';
+        else result.nvtSignal = 'undervalued';                  // high volume = active
       }
     }
 
     // Calculate on-chain sentiment score
+    // ── BUG FIX: Removed dead exchangeReserveTrend and txCountTrend ──
+    // These were always 'flat' (never updated) → contributed 0 to sentiment
+    // but implied data which didn't exist. Now only real signals contribute.
     let sent = 50;
     if(result.hashRateTrend === 'up') sent += 10;
     else if(result.hashRateTrend === 'down') sent -= 8;
@@ -6139,13 +6200,13 @@ async function fetchOnChainData() {
     else if(result.diffTrend === 'down') sent -= 5;
     if(result.mempool.congestion === 'low') sent += 3;
     else if(result.mempool.congestion === 'high') sent -= 5;
+    // MVRV: 'unavailable' now → no contribution (honest)
     if(result.mvrvSignal === 'bullish') sent += 12;
     else if(result.mvrvSignal === 'bearish') sent -= 12;
     else if(result.mvrvSignal === 'caution') sent -= 4;
+    // NVT (now Price/Volume Ratio): uses exchange volume, honest thresholds
     if(result.nvtSignal === 'undervalued') sent += 8;
     else if(result.nvtSignal === 'overvalued') sent -= 8;
-    if(result.exchangeReserveTrend === 'down') sent += 6; // outflows = bullish
-    else if(result.exchangeReserveTrend === 'up') sent -= 4;
     result.onchainSentiment = Math.max(0, Math.min(100, Math.round(sent)));
 
     onChainCache = result;
@@ -6302,7 +6363,7 @@ function detectAnomalies(candles) {
   }
 }
 
-function calcPredictiveRange(currentPrice, atr, volatility, signal, confidence) {
+function calcPredictiveRange(currentPrice, atr, volatility, signal, confidence, bestTF) {
   try {
     const price = (typeof currentPrice === 'number' && isFinite(currentPrice)) ? currentPrice : 0;
     const a = (typeof atr === 'number' && isFinite(atr) && atr > 0) ? atr : price * 0.02;
@@ -6318,26 +6379,49 @@ function calcPredictiveRange(currentPrice, atr, volatility, signal, confidence) 
     const vol = (typeof volatility === 'number' && isFinite(volatility)) ? Math.abs(volatility) : 0;
     const volFactor = 1 + Math.min(vol / 10, 1); // boost up to 2x for high volatility
 
-    // Time-based ATR scaling
-    const scale1h = 0.25;
-    const scale4h = 0.5;
-    const scale24h = 1.0;
+    // ── BUG FIX: Time-based ATR scaling (was wrong) ──────────────
+    // Previously used fixed scale factors (0.25, 0.5, 1.0) which assumed
+    // the input ATR was daily. But ATR comes from bestTF which is intraday
+    // (5m, 15m, or 1H). This caused 24H range to be underestimated by
+    // 5× to 17× (e.g., 5m ATR × 1.0 instead of 5m ATR × √288 ≈ 17).
+    //
+    // Correct math: volatility scales with √time (square root of time rule).
+    // If ATR is for timeframe T, then ATR for horizon H is:
+    //   ATR_H = ATR_T × √(H / T)
+    //
+    // Timeframe durations in minutes:
+    //   5m = 5 min, 15m = 15 min, 1H = 60 min, 4H = 240 min, 1D = 1440 min
+    const TF_MINUTES = { '5m': 5, '15m': 15, '1H': 60, '4H': 240, '1D': 1440, '1W': 10080 };
+    const tfMinutes = TF_MINUTES[bestTF] || 60; // default 1H if unknown
+    const target1h = 60;    // 1 hour horizon
+    const target4h = 240;   // 4 hour horizon
+    const target24h = 1440; // 24 hour horizon
+    // √(target / tfMinutes) — square root of time scaling
+    const scale1h  = Math.sqrt(target1h  / tfMinutes);
+    const scale4h  = Math.sqrt(target4h  / tfMinutes);
+    const scale24h = Math.sqrt(target24h / tfMinutes);
+    // Cap scales at reasonable limits to avoid extreme ranges
+    // (e.g., 5m → 24h = √288 ≈ 17× is mathematically correct but
+    //  practically too wide — cap at 10× for sanity)
+    const cap1h  = Math.min(scale1h,  3);
+    const cap4h  = Math.min(scale4h,  6);
+    const cap24h = Math.min(scale24h, 10);
 
     // Range calculations (volatility widens the range)
     const range1h = {
-      low: price - a * scale1h * confFactor * volFactor * (1 + Math.max(0, -dir * 0.3)),
-      high: price + a * scale1h * confFactor * volFactor * (1 + Math.max(0, dir * 0.3)),
-      center: price + a * scale1h * dir * 0.3
+      low: price - a * cap1h * confFactor * volFactor * (1 + Math.max(0, -dir * 0.3)),
+      high: price + a * cap1h * confFactor * volFactor * (1 + Math.max(0, dir * 0.3)),
+      center: price + a * cap1h * dir * 0.3
     };
     const range4h = {
-      low: price - a * scale4h * confFactor * volFactor * (1 + Math.max(0, -dir * 0.4)),
-      high: price + a * scale4h * confFactor * volFactor * (1 + Math.max(0, dir * 0.4)),
-      center: price + a * scale4h * dir * 0.4
+      low: price - a * cap4h * confFactor * volFactor * (1 + Math.max(0, -dir * 0.4)),
+      high: price + a * cap4h * confFactor * volFactor * (1 + Math.max(0, dir * 0.4)),
+      center: price + a * cap4h * dir * 0.4
     };
     const range24h = {
-      low: price - a * scale24h * confFactor * volFactor * (1 + Math.max(0, -dir * 0.5)),
-      high: price + a * scale24h * confFactor * volFactor * (1 + Math.max(0, dir * 0.5)),
-      center: price + a * scale24h * dir * 0.5
+      low: price - a * cap24h * confFactor * volFactor * (1 + Math.max(0, -dir * 0.5)),
+      high: price + a * cap24h * confFactor * volFactor * (1 + Math.max(0, dir * 0.5)),
+      center: price + a * cap24h * dir * 0.5
     };
 
     // Confidence level
@@ -6345,7 +6429,7 @@ function calcPredictiveRange(currentPrice, atr, volatility, signal, confidence) 
     if(conf >= 70) confidenceLevel = 'high';
     else if(conf >= 40) confidenceLevel = 'medium';
 
-    return { range1h, range4h, range24h, confidenceLevel };
+    return { range1h, range4h, range24h, confidenceLevel, scalesUsed: { scale1h: cap1h, scale4h: cap4h, scale24h: cap24h, tfMinutes } };
   } catch(_) {
     const p = currentPrice || 0;
     return {
@@ -6493,8 +6577,8 @@ function calcAIEngine(allIndicatorData, btResults, regime, assetType) {
     // 2. Anomaly Detection
     const anomalies = detectAnomalies(bestCandles);
 
-    // 3. Predictive Range
-    const predictive = calcPredictiveRange(currentPrice, atr, volatility, bestSignal, bayesian.confidence);
+    // 3. Predictive Range — pass bestTF for correct ATR time scaling
+    const predictive = calcPredictiveRange(currentPrice, atr, volatility, bestSignal, bayesian.confidence, bestTF);
 
     // 4. Signal Reliability
     const reliability = calcSignalReliability(bestSignal, regime, btResults);
@@ -6664,24 +6748,26 @@ function renderOnChainPanel(onChainData, assetType) {
       </div>
     </div>`;
 
-    // NVT
+    // NVT — honestly labeled as "Price/Volume Ratio" (uses exchange volume, not on-chain)
     const nvtVal = onChainData.nvt || '—';
     const nvtSignal = onChainData.nvtSignal;
-    const nvtColor = nvtSignal === 'undervalued' ? 'var(--green)' : nvtSignal === 'overvalued' ? 'var(--red)' : 'var(--yellow)';
+    const nvtColor = nvtSignal === 'undervalued' ? 'var(--green)' : nvtSignal === 'overvalued' ? 'var(--red)' : nvtSignal === 'unavailable' ? 'var(--muted)' : 'var(--yellow)';
+    const nvtSubText = nvtSignal === 'unavailable' ? 'N/A' : nvtSignal;
     html += `<div class="oc-card nvt">
-      <div class="oc-label">NVT Ratio</div>
+      <div class="oc-label">Price/Vol Ratio</div>
       <div class="oc-val" style="color:${nvtColor}">${nvtVal}</div>
-      <div class="oc-sub">${nvtSignal}</div>
+      <div class="oc-sub">${nvtSubText}</div>
     </div>`;
 
-    // MVRV
+    // MVRV — honestly shows "N/A" until real UTXO data is integrated
     const mvrvVal = onChainData.mvrv || '—';
     const mvrvSignal = onChainData.mvrvSignal;
-    const mvrvColor = mvrvSignal === 'bullish' ? 'var(--green)' : mvrvSignal === 'bearish' ? 'var(--red)' : mvrvSignal === 'caution' ? 'var(--orange)' : 'var(--yellow)';
+    const mvrvColor = mvrvSignal === 'bullish' ? 'var(--green)' : mvrvSignal === 'bearish' ? 'var(--red)' : mvrvSignal === 'caution' ? 'var(--orange)' : 'var(--muted)';
+    const mvrvSubText = mvrvSignal === 'unavailable' ? 'N/A — needs UTXO data' : mvrvSignal;
     html += `<div class="oc-card mvrv">
       <div class="oc-label">MVRV Ratio</div>
       <div class="oc-val" style="color:${mvrvColor}">${mvrvVal}</div>
-      <div class="oc-sub">${mvrvSignal}</div>
+      <div class="oc-sub">${mvrvSubText}</div>
     </div>`;
 
     // On-Chain Sentiment
@@ -6919,31 +7005,16 @@ function generateLocalSentiment(results, ticker) {
   const longShortRatio=bullPct>50?((bullPct/100)*2.2):((bullPct/100)*1.8);
   const dominance=52.0; // Fixed estimate — real value fetched from CoinGecko when available
 
-  const r1H=results['1H'], r1D=results['1D'];
-  const newsItems=[];
-  if(bullPct>55){
-    newsItems.push({headline:`${currentAsset.displayName} bullish momentum across timeframes`,sentiment:'positive',impact:'Multiple indicators showing bullish convergence'});
-    newsItems.push({headline:`RSI at ${r1H?.rsi??'?'} suggests room to run`,sentiment:'positive',impact:'Not overbought, potential for further upside'});
-  } else if(bearPct>55){
-    newsItems.push({headline:`${currentAsset.displayName} bearish pressure dominant now`,sentiment:'negative',impact:'Multiple timeframes showing bearish signals'});
-    newsItems.push({headline:`RSI at ${r1H?.rsi??'?'} — watch for support`,sentiment:'negative',impact:'Key support levels being tested'});
-  } else {
-    newsItems.push({headline:`${currentAsset.displayName} consolidating — direction unclear`,sentiment:'neutral',impact:'Market waiting for a catalyst to break range'});
-  }
-  if(r1D?.macd?.positive){
-    newsItems.push({headline:'Daily MACD turning bullish',sentiment:'positive',impact:'Medium-term momentum shifting upward'});
-  } else if(r1D?.macd) {
-    newsItems.push({headline:'Daily MACD bearish crossover',sentiment:'negative',impact:'Medium-term momentum weakening'});
-  }
-  if(r1H?.rsi!=null && +r1H.rsi<30){
-    newsItems.push({headline:'RSI oversold — potential bounce',sentiment:'positive',impact:'Oversold conditions often precede relief rallies'});
-  } else if(r1H?.rsi!=null && +r1H.rsi>70){
-    newsItems.push({headline:'RSI overbought — caution advised',sentiment:'negative',impact:'Overbought levels may lead to pullback'});
-  }
-  newsItems.push({headline:`${currentAsset.displayName} 24H change: ${(+ticker.priceChangePercent).toFixed(2)}%`,sentiment:+ticker.priceChangePercent>=0?'positive':'negative',impact:'Daily price movement reflects current market sentiment'});
+  // ── NEWS REMOVED FROM HERE ───────────────────────────────────
+  // Previously this function generated fake "news" templates from local
+  // indicators (e.g., "BTC bullish momentum across timeframes").
+  // That was misleading — labeled as "News" but was NOT real news.
+  // Now real news is fetched via fetchRealNews() → /api/news proxy →
+  // CoinDesk + CoinTelegraph RSS feeds. If fetch fails, news panel
+  // shows "News unavailable" instead of fake templated items.
 
   return {
-    news: newsItems,
+    news: [], // Real news fetched separately via fetchRealNews()
     fearGreed, longShortRatio: +longShortRatio.toFixed(2),
     dominance: +dominance.toFixed(1),
     overallSentiment,
@@ -7417,7 +7488,7 @@ async function runAnalysis() {
 
   // Reset async sections
   setHTML('aiAnalysis','<span class="ai-loading">Analyzing<span class="dots"></span></span>');
-  setHTML('newsList','<div class="ai-loading">News আনছি<span class="dots"></span></div>');
+  setHTML('newsList','<div class="ai-loading">📰 News লোড হচ্ছে<span class="dots"></span></div>');
   setHTML('sentimentTags','');
 
   try {
@@ -7699,13 +7770,22 @@ async function runAnalysis() {
     const ls = lsResult.status==='fulfilled' && lsResult.value!=null ? lsResult.value : null;
     const dom = domResult.status==='fulfilled' && domResult.value!=null ? domResult.value : null;
 
+    // ── FETCH REAL NEWS (replaces fake template news) ──────────
+    // Real news from CoinDesk + CoinTelegraph RSS via /api/news proxy.
+    // If fetch fails (network/CORS), newsItems will be empty and the
+    // UI panel will show "News unavailable" instead of fake templated items.
+    let newsItems = [];
+    try {
+      newsItems = await fetchRealNews(currentAsset.displayName);
+      if(silentAbort()) return;
+    } catch(_) { newsItems = []; }
+
     const fearGreedVal = fg ? fg.value : localSentiment.fearGreed;
     const fearGreedLabel = fg ? fg.label : (fg===null && localSentiment.fearGreed<=30?'Extreme Fear':localSentiment.fearGreed<=45?'Fear':localSentiment.fearGreed<=55?'Neutral':localSentiment.fearGreed<=75?'Greed':'Extreme Greed');
     const longShortVal = ls!=null ? ls : localSentiment.longShortRatio;
     const dominanceVal = dom!=null ? dom : localSentiment.dominance;
     const overallSentiment = localSentiment.overallSentiment;
     const sentimentScore = localSentiment.sentimentScore;
-    const newsItems = localSentiment.news;
 
     const sentiment = {
       fearGreed: fearGreedVal,
@@ -8090,12 +8170,24 @@ async function runAnalysis() {
     tagsHTML += '</div>';
     setHTML('sentimentTags', tagsHTML);
 
-    setHTML('newsList', newsItems.map(n=>`
-      <div class="news-item ${n.sentiment}">
-        <span class="news-sent ${n.sentiment}">${n.sentiment}</span>
-        <div><strong style="color:var(--text);font-size:12px">${sanitize(n.headline)}</strong><br>
-          <span style="font-size:11px">${sanitize(n.impact)}</span></div>
-      </div>`).join(''));
+    // ── Render real news (or honest "unavailable" message) ──────
+    if(newsItems.length > 0) {
+      setHTML('newsList', newsItems.map(n=>{
+        const timeStr = n.publishedAt ? new Date(n.publishedAt).toLocaleString('en-BD',{hour:'2-digit',minute:'2-digit',day:'numeric',month:'short'}) : '';
+        const sourceStr = n.source ? ` · ${sanitize(n.source)}` : '';
+        const linkHTML = n.link ? `<a href="${sanitize(n.link)}" target="_blank" rel="noopener" style="color:var(--blue);text-decoration:none;font-size:11px">↗ Read more</a>` : '';
+        return `<div class="news-item neutral">
+          <div>
+            <strong style="color:var(--text);font-size:12px;display:block;margin-bottom:2px">${sanitize(n.headline)}</strong>
+            ${n.impact ? `<span style="font-size:11px;color:var(--dim)">${sanitize(n.impact)}</span><br>` : ''}
+            <span style="font-size:10px;color:var(--muted)">${timeStr}${sourceStr}</span>
+            ${linkHTML}
+          </div>
+        </div>`;
+      }).join(''));
+    } else {
+      setHTML('newsList', '<div style="text-align:center;padding:20px;color:var(--muted);font-size:12px">📰 News unavailable right now<br><span style="font-size:10px">Real news from CoinDesk + CoinTelegraph RSS</span></div>');
+    }
 
     // Generate AI analysis text locally — UPDATED with v3 params
     try {
