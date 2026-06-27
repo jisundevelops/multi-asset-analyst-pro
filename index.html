@@ -1752,6 +1752,199 @@ function stochD(cs,k=14,d=3){
   return sma(kVals,d);
 }
 function vwap(cs){if(!cs||cs.length===0)return null;let cv=0,ctv=0;for(const c of cs){const tp=(c.h+c.l+c.c)/3;ctv+=tp*c.v;cv+=c.v;}return cv===0?cs[cs.length-1].c:ctv/cv;}
+
+// ── Hurst Exponent (R/S Analysis) ───────────────────────────────
+// Measures long-range dependence of price series.
+// Uses Rescaled Range (R/S) method — most reliable for financial data.
+//   H > 0.55: trending market — trend-following has positive edge
+//   H < 0.45: mean-reverting — oscillator-based strategies work
+//   0.45-0.55: random walk — no statistical edge, reduce position size
+// Updates regime detection with a mathematically grounded measure.
+function calcHurstExponent(closes, minPeriod=8, maxPeriod=64) {
+  try {
+    if(!closes || closes.length < maxPeriod * 2) return null;
+
+    const series = closes.slice(-Math.min(closes.length, 128));
+    const n = series.length;
+
+    // Log returns
+    const returns = [];
+    for(let i=1; i<n; i++) {
+      if(series[i-1] > 0) returns.push(Math.log(series[i] / series[i-1]));
+    }
+    if(returns.length < minPeriod * 2) return null;
+
+    // R/S for different sub-period lengths
+    const rsList = [];
+    for(let period = minPeriod; period <= Math.min(maxPeriod, returns.length/2); period *= 2) {
+      const chunks = Math.floor(returns.length / period);
+      if(chunks < 2) continue;
+      let rsSum = 0;
+      for(let c=0; c<chunks; c++) {
+        const chunk = returns.slice(c*period, (c+1)*period);
+        const mean  = chunk.reduce((a,b)=>a+b,0) / period;
+        // Cumulative deviations
+        const devs = chunk.map((v,i,arr) => arr.slice(0,i+1).reduce((a,b)=>a+b,0) - mean*(i+1));
+        const R = Math.max(...devs) - Math.min(...devs);
+        const S = Math.sqrt(chunk.reduce((s,v)=>s+Math.pow(v-mean,2),0) / period);
+        if(S > 0) rsSum += R / S;
+      }
+      const avgRS = rsSum / chunks;
+      if(avgRS > 0) rsList.push({ logN: Math.log(period), logRS: Math.log(avgRS) });
+    }
+
+    if(rsList.length < 3) return null;
+
+    // Linear regression of log(R/S) vs log(n) — slope = Hurst exponent
+    const meanX = rsList.reduce((a,p)=>a+p.logN,0) / rsList.length;
+    const meanY = rsList.reduce((a,p)=>a+p.logRS,0) / rsList.length;
+    const num   = rsList.reduce((a,p)=>a+(p.logN-meanX)*(p.logRS-meanY),0);
+    const den   = rsList.reduce((a,p)=>a+Math.pow(p.logN-meanX,2),0);
+    if(den === 0) return null;
+    const H = num / den;
+    const hClamped = Math.max(0.1, Math.min(0.9, H));
+
+    let regime = 'random';
+    let signal = 'neutral';
+    if(hClamped > 0.55)      { regime = 'trending';      signal = 'trending'; }
+    else if(hClamped < 0.45) { regime = 'mean_reverting'; signal = 'reverting'; }
+    else                     { regime = 'random_walk';    signal = 'neutral'; }
+
+    return { H: +hClamped.toFixed(3), regime, signal };
+  } catch(_) { return null; }
+}
+
+// ── Market Profile (Volume Profile Approximation) ───────────────
+// Hedge funds use Market Profile to find:
+//   POC (Point of Control) = price with most activity = strongest S/R
+//   VAH (Value Area High)  = top of 70% activity zone
+//   VAL (Value Area Low)   = bottom of 70% activity zone
+// Price returning to POC = high-probability mean-reversion entry
+// Price breaking VAH/VAL with volume = breakout confirmation
+function calcMarketProfile(candles, buckets=50) {
+  try {
+    if(!candles || candles.length < 10) return null;
+
+    const highs  = candles.map(c=>c.h);
+    const lows   = candles.map(c=>c.l);
+    const priceHigh = Math.max(...highs);
+    const priceLow  = Math.min(...lows);
+    if(priceHigh <= priceLow) return null;
+
+    const bucketSize = (priceHigh - priceLow) / buckets;
+    const profile = new Array(buckets).fill(0);
+
+    // Fill profile: each candle distributes its volume across price range it covers
+    for(const c of candles) {
+      const vol = c.v > 0 ? c.v : 1; // use 1 if no volume (time-based approximation)
+      const loIdx = Math.max(0, Math.floor((c.l - priceLow) / bucketSize));
+      const hiIdx = Math.min(buckets-1, Math.floor((c.h - priceLow) / bucketSize));
+      const span  = hiIdx - loIdx + 1;
+      const volPerBucket = vol / span;
+      for(let i = loIdx; i <= hiIdx; i++) profile[i] += volPerBucket;
+    }
+
+    // POC = bucket with highest volume
+    let pocIdx = 0;
+    for(let i=1; i<buckets; i++) if(profile[i] > profile[pocIdx]) pocIdx = i;
+    const poc = priceLow + (pocIdx + 0.5) * bucketSize;
+
+    // Value Area = 70% of total volume centered around POC
+    const totalVol = profile.reduce((a,b)=>a+b,0);
+    const vaTarget = totalVol * 0.70;
+    let vaVol = profile[pocIdx], loI = pocIdx, hiI = pocIdx;
+    while(vaVol < vaTarget && (loI > 0 || hiI < buckets-1)) {
+      const addHi = hiI < buckets-1 ? profile[hiI+1] : 0;
+      const addLo = loI > 0         ? profile[loI-1] : 0;
+      if(addHi >= addLo && hiI < buckets-1) { hiI++; vaVol += profile[hiI]; }
+      else if(loI > 0) { loI--; vaVol += profile[loI]; }
+      else break;
+    }
+    const vah = priceLow + (hiI + 1) * bucketSize;
+    const val = priceLow + loI * bucketSize;
+
+    const price = candles[candles.length-1].c;
+    const inValueArea = price >= val && price <= vah;
+    const aboveVAH    = price > vah;
+    const belowVAL    = price < val;
+    const nearPOC     = Math.abs(price - poc) / price < 0.005; // within 0.5%
+
+    // Signal: price at POC = mean reversion magnet
+    // Price above VAH = breakout zone (bullish)
+    // Price below VAL = breakdown zone (bearish)
+    let mpSignal = 'neutral', mpScore = 50;
+    if(nearPOC)     { mpSignal = 'neutral'; mpScore = 50; }   // at POC — could go either way
+    else if(aboveVAH) { mpSignal = 'bull';  mpScore = 72; }   // above value area = bullish continuation
+    else if(belowVAL) { mpSignal = 'bear';  mpScore = 28; }   // below value area = bearish continuation
+    else if(inValueArea && price > poc) { mpSignal = 'bear'; mpScore = 42; } // in VA above POC — revert to POC
+    else if(inValueArea && price < poc) { mpSignal = 'bull'; mpScore = 58; } // in VA below POC — revert to POC
+
+    return { poc, vah, val, price, inValueArea, aboveVAH, belowVAL, nearPOC,
+             mpSignal, mpScore, bucketSize };
+  } catch(_) { return null; }
+}
+
+// ── Anchored VWAP ─────────────────────────────────────────────
+// Institutional traders anchor VWAP to significant price events:
+//   1. Last major swing high (most recent HTF swing high)
+//   2. Last major swing low  (most recent HTF swing low)
+// Price relative to these anchored VWAPs reveals institutional bias:
+//   Above swing-low AVWAP + below swing-high AVWAP = consolidation
+//   Above both → strong bullish institutional accumulation
+//   Below both → strong bearish institutional distribution
+function calcAnchoredVWAP(candles) {
+  try {
+    if(!candles || candles.length < 10) return null;
+
+    // Find last major swing high and swing low (lookback 3 bars each side)
+    let swingHighIdx = -1, swingLowIdx = -1;
+    for(let i = candles.length - 4; i >= 3; i--) {
+      const c = candles[i];
+      const isHigh = c.h > candles[i-1].h && c.h > candles[i-2].h &&
+                     c.h > candles[i+1].h && c.h > candles[i+2].h;
+      const isLow  = c.l < candles[i-1].l && c.l < candles[i-2].l &&
+                     c.l < candles[i+1].l && c.l < candles[i+2].l;
+      if(isHigh && swingHighIdx === -1) swingHighIdx = i;
+      if(isLow  && swingLowIdx  === -1) swingLowIdx  = i;
+      if(swingHighIdx !== -1 && swingLowIdx !== -1) break;
+    }
+
+    // Calculate VWAP anchored from each swing point to now
+    const calcFrom = (startIdx) => {
+      if(startIdx < 0) return null;
+      let cv = 0, ctv = 0;
+      for(let i = startIdx; i < candles.length; i++) {
+        const tp = (candles[i].h + candles[i].l + candles[i].c) / 3;
+        ctv += tp * (candles[i].v || 1);
+        cv  += (candles[i].v || 1);
+      }
+      return cv > 0 ? ctv / cv : null;
+    };
+
+    const avwapHigh = swingHighIdx !== -1 ? calcFrom(swingHighIdx) : null;
+    const avwapLow  = swingLowIdx  !== -1 ? calcFrom(swingLowIdx)  : null;
+    const price     = candles[candles.length - 1].c;
+
+    // Institutional bias from anchored VWAPs
+    let bias = 'neutral', biasScore = 50;
+    if(avwapHigh !== null && avwapLow !== null) {
+      const aboveHigh = price > avwapHigh;
+      const aboveLow  = price > avwapLow;
+      if(aboveHigh && aboveLow)   { bias = 'bull'; biasScore = 80; } // above both = institutional accumulation
+      else if(!aboveHigh && !aboveLow) { bias = 'bear'; biasScore = 20; } // below both = distribution
+      else if(aboveLow && !aboveHigh)  { bias = 'neutral'; biasScore = 50; } // between = consolidation
+    } else if(avwapLow !== null) {
+      bias = price > avwapLow ? 'bull' : 'bear';
+      biasScore = price > avwapLow ? 65 : 35;
+    } else if(avwapHigh !== null) {
+      bias = price > avwapHigh ? 'bull' : 'bear';
+      biasScore = price > avwapHigh ? 65 : 35;
+    }
+
+    return { avwapHigh, avwapLow, bias, biasScore,
+             swingHighIdx, swingLowIdx, price };
+  } catch(_) { return null; }
+}
 // Unified MACD engine — returns MACD line, signal line, and histogram
 // This is the single source of truth; detectMACDDivergence also uses this
 function macd(arr,returnSeries=false){
@@ -2574,6 +2767,29 @@ function analyzeTF(rawData, price, assetType) {
   const tp2=signal==='bull'?price+atrV*_tp2m:signal==='bear'?price-atrV*_tp2m:price+atrV*1.5;
   const sl2=signal==='bull'?price-atrV*_slm :signal==='bear'?price+atrV*_slm :price-atrV*0.5;
 
+  // ── Z-Score Mean Reversion (period=20) ──────────────────────
+  // Measures how many std deviations price is from rolling mean.
+  // Hedge funds use this to identify extremes in ranging markets.
+  //   Z < -2.0 → extreme oversold  → mean reversion BUY signal
+  //   Z > +2.0 → extreme overbought → mean reversion SELL signal
+  //   |Z| < 1.0 → neutral / trending zone
+  let zScore = null, zSignal = 'neutral';
+  try {
+    const _zPeriod = 20;
+    if(closes.length >= _zPeriod) {
+      const _zSlice = closes.slice(-_zPeriod);
+      const _zMean  = _zSlice.reduce((a,b)=>a+b,0) / _zPeriod;
+      const _zStd   = Math.sqrt(_zSlice.reduce((s,v)=>s+Math.pow(v-_zMean,2),0) / _zPeriod);
+      zScore = _zStd > 0 ? (price - _zMean) / _zStd : 0;
+      // Signal: mean reversion logic
+      if     (zScore < -2.0) { zSignal = 'strong_bull'; add3('bull', 2); } // extreme oversold
+      else if(zScore < -1.0) { zSignal = 'bull';        add3('bull', 1); }
+      else if(zScore >  2.0) { zSignal = 'strong_bear'; add3('bear', 2); } // extreme overbought
+      else if(zScore >  1.0) { zSignal = 'bear';        add3('bear', 1); }
+      // -1 to +1: no weight added (neutral zone)
+    }
+  } catch(_) {}
+
   return {rsi:ri?.toFixed(1),sma20:s20!=null?smartToFixed(s20):null,sma50:s50!=null?smartToFixed(s50):null,
     ema21:e21!=null?smartToFixed(e21):null,bb:bband,atr:smartToFixed(atrV),stoch:stK?.toFixed(1),stochD:stD?.toFixed(1),
     vwap:vw!=null?smartToFixed(vw):null,macd:mc,signal,bullPct,bearPct,prob,
@@ -2582,7 +2798,9 @@ function analyzeTF(rawData, price, assetType) {
     cmf:cmfData, williamsR:williamsRData, liqSweep:liqSweepData,
     regime, atrPct, bbWidth, volumeTrend,
     bullScore:bull,bearScore:bear,total,
-    tp1:smartToFixed(tp1),tp2:smartToFixed(tp2),sl:smartToFixed(sl2)};
+    tp1:smartToFixed(tp1),tp2:smartToFixed(tp2),sl:smartToFixed(sl2),
+    zScore:zScore!==null?+zScore.toFixed(3):null, zSignal,
+    avwap:avwapData, marketProfile:mpData, hurst:hurstData};
 }
 
 // ── FORMAT ──────────────────────────────────────────────────────
@@ -3756,6 +3974,64 @@ function renderAdvancedIndicators(adxData, ichiData, obvData, squeezeData, cciDa
     // Williams %R
     if(williamsRData){
       html += `<div class="ind-row"><span class="ind-name">Williams %R</span><div class="ind-right"><span class="ind-val">${williamsRData.value}</span><span class="ind-sig ${williamsRData.signal}">${williamsRData.value<-80?'Oversold':williamsRData.value>-20?'Overbought':'Neutral'}</span></div></div>`;
+    }
+    // Hurst Exponent — determines if market is trending or mean-reverting
+  // This modulates how much weight trend vs oscillator indicators get
+  const hurstData = calcHurstExponent(closes);
+
+  // Hurst-based weight modifier: trending → boost trend signals, reverting → boost oscillators
+  // We don't add hurst directly to bull/bear — instead it's used as multiplier
+  // (scored independently and added to return object for display + masterScore)
+
+  // Market Profile — POC / Value Area
+  const mpData = calcMarketProfile(candles);
+  if(mpData && mpData.mpSignal !== 'neutral') {
+    add3(mpData.mpSignal, 1.2);
+  }
+
+  // Anchored VWAP — institutional bias signal
+  const avwapData = calcAnchoredVWAP(candles);
+  if(avwapData && avwapData.bias !== 'neutral') {
+    // Weight: 1.5 — institutional money flow indicator
+    add3(avwapData.bias, 1.5);
+  }
+
+  // Market Profile
+    if(r.marketProfile){
+      const _mp = r.marketProfile;
+      const _mpCol = _mp.mpSignal==='bull'?'var(--green)':_mp.mpSignal==='bear'?'var(--red)':'var(--yellow)';
+      const _mpTxt = _mp.nearPOC?'At POC (magnet)':_mp.aboveVAH?'Above VAH (bullish)':_mp.belowVAL?'Below VAL (bearish)':_mp.inValueArea?'In Value Area':'—';
+      html += '<div class="ind-row"><span class="ind-name">Mkt Profile</span><div class="ind-right">'
+        + '<span style="font-size:9px;color:var(--muted);margin-right:4px">POC:'+fmtPrice(smartToFixed(_mp.poc))+'</span>'
+        + '<span class="ind-sig '+(_mp.mpSignal==='bull'?'bull':_mp.mpSignal==='bear'?'bear':'neutral')+'">'+_mpTxt+'</span></div></div>';
+    }
+  // Anchored VWAP
+    if(r.avwap && (r.avwap.avwapHigh || r.avwap.avwapLow)){
+      const _av = r.avwap;
+      const _avBias = _av.bias==='bull'?'bull':_av.bias==='bear'?'bear':'neutral';
+      const _avTxt  = _av.bias==='bull'?'Institutional Buy':_av.bias==='bear'?'Institutional Sell':'Consolidation';
+      let _avStr = '<div class="ind-row"><span class="ind-name">Anch. VWAP</span><div class="ind-right">';
+      if(_av.avwapHigh) _avStr += '<span style="font-size:9px;color:var(--red);margin-right:4px">H:'+fmtPrice(smartToFixed(_av.avwapHigh))+'</span>';
+      if(_av.avwapLow)  _avStr += '<span style="font-size:9px;color:var(--green);margin-right:4px">L:'+fmtPrice(smartToFixed(_av.avwapLow))+'</span>';
+      _avStr += '<span class="ind-sig '+_avBias+'">'+_avTxt+'</span></div></div>';
+      html += _avStr;
+    }
+  // Hurst Exponent display
+    if(r.hurst){
+      const _h = r.hurst;
+      const _hCol = _h.regime==='trending'?'var(--cyan)':_h.regime==='mean_reverting'?'var(--orange)':'var(--muted)';
+      const _hTxt = _h.regime==='trending'?'Trending (H>0.55)':_h.regime==='mean_reverting'?'Mean-Rev (H<0.45)':'Random Walk';
+      html += '<div class="ind-row"><span class="ind-name">Hurst (H)</span><div class="ind-right">'
+        + '<span class="ind-val" style="color:'+_hCol+'">'+_h.H+'</span>'
+        + '<span class="ind-sig neutral">'+_hTxt+'</span></div></div>';
+    }
+  // Z-Score Mean Reversion
+    if(r.zScore !== null && r.zScore !== undefined){
+      const _zv = r.zScore;
+      const _zSig = _zv < -2 ? 'strong_bull' : _zv < -1 ? 'bull' : _zv > 2 ? 'strong_bear' : _zv > 1 ? 'bear' : 'neutral';
+      const _zCol = _zv < -1 ? 'var(--green)' : _zv > 1 ? 'var(--red)' : 'var(--yellow)';
+      const _zTxt = _zv < -2 ? 'Extreme Oversold' : _zv < -1 ? 'Oversold' : _zv > 2 ? 'Extreme Overbought' : _zv > 1 ? 'Overbought' : 'Neutral Zone';
+      html += `<div class="ind-row"><span class="ind-name">Z-Score</span><div class="ind-right"><span class="ind-val" style="color:${_zCol}">${_zv.toFixed(2)}σ</span><span class="ind-sig ${_zv<-1?'bull':_zv>1?'bear':'neutral'}">${_zTxt}</span></div></div>`;
     }
     // Liquidity Sweep
     if(liqSweepData && liqSweepData.sweeps && liqSweepData.sweeps.length > 0){
@@ -7061,6 +7337,24 @@ async function runAnalysis() {
     else if(bestRegime === 'BREAKOUT') regimeScore = volData.spike ? 70 : 50;
     else if(bestRegime === 'REVERSAL') regimeScore = 50; // direction unknown in reversal — no bias
 
+    // Hurst Exponent adjustment to regimeScore
+    // If H > 0.55 (trending) and signal aligns → boost confidence
+    // If H < 0.45 (mean-reverting) and signal from oscillators → boost confidence
+    // H ≈ 0.5 (random walk) → reduce confidence (reduce regimeScore toward 50)
+    const bestHurst = bestResult?.hurst;
+    if(bestHurst) {
+      if(bestHurst.regime === 'trending' && bestRegime === 'TRENDING') {
+        // Double confirmation — Hurst and ADX agree it's trending
+        regimeScore = regimeScore > 50 ? Math.min(90, regimeScore + 8) : Math.max(10, regimeScore - 8);
+      } else if(bestHurst.regime === 'mean_reverting' && bestRegime === 'RANGING') {
+        // Mean-reverting confirmed — oscillator signals more reliable
+        regimeScore = 50; // neutral — let oscillators determine direction
+      } else if(bestHurst.regime === 'random_walk') {
+        // No statistical edge — pull regimeScore toward 50 (reduce conviction)
+        regimeScore = Math.round(regimeScore * 0.5 + 50 * 0.5);
+      }
+    }
+
     // ── Phase 2: CVD, Whale, Harmonics ────────────────────────────
     let cvdData = {value:0, trend:'neutral', divergence:false};
     let deltaVolData = {recentDelta:0, trend:'neutral'};
@@ -8502,7 +8796,47 @@ function _tjRenderAnalytics() {
 
     <div style="text-align:center;margin-top:8px">
       <button class="tj-clear-btn" onclick="tjClearAll()">🗑 All Data Clear করো</button>
-    </div>`;
+    </div>
+
+    ${(() => {
+      if(closed.length < 5) return '';
+      // Kelly Criterion: f* = (b*p - q) / b
+      // p = win prob, q = loss prob, b = avg reward/risk ratio
+      const _p = wins / closed.length;
+      const _q = 1 - _p;
+      const _rrs = closed.map(t => {
+        if(!t.tp1 || !t.sl || !t.entry) return null;
+        const risk   = Math.abs(+t.entry - +t.sl);
+        const reward = Math.abs(+t.tp1   - +t.entry);
+        return risk > 0 ? reward / risk : null;
+      }).filter(v => v !== null);
+      const _b = _rrs.length > 0 ? _rrs.reduce((a,c)=>a+c,0)/_rrs.length : 1.5;
+      const _kelly     = _b > 0 ? (_b*_p - _q)/_b : 0;
+      const _halfKelly = Math.max(0, _kelly/2);
+      const _kPct      = Math.min(25, Math.round(_halfKelly*100));
+      const _kCol      = _kPct>=10?'var(--green)':_kPct>=5?'var(--yellow)':'var(--red)';
+      const _kMsg      = _kPct>=10?'Good edge — size up confidently'
+                       : _kPct>=5 ?'Modest edge — conservative sizing'
+                       : _kPct>0  ?'Weak edge — minimum size only'
+                       :            'Negative edge — do NOT trade';
+      return '<div class="tj-analytics-card" style="margin-bottom:12px">'
+        + '<div class="tj-analytics-title">📐 Kelly Criterion — Optimal Position Size</div>'
+        + '<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:10px 0">'
+        + '<div style="background:var(--bg3);border:1px solid var(--border);border-radius:8px;padding:12px;text-align:center">'
+        + '<div style="font-size:28px;font-weight:800;font-family:JetBrains Mono,monospace;color:'+_kCol+'">'+_kPct+'%</div>'
+        + '<div style="font-size:10px;color:var(--muted);margin-top:2px">Half-Kelly Size</div>'
+        + '</div>'
+        + '<div style="background:var(--bg3);border:1px solid var(--border);border-radius:8px;padding:12px">'
+        + '<div style="font-size:10px;color:var(--muted);margin-bottom:6px">Journal থেকে calculated</div>'
+        + '<div style="font-size:11px;margin-bottom:3px">Win Rate: <strong style="color:var(--cyan)">'+Math.round(_p*100)+'%</strong></div>'
+        + '<div style="font-size:11px;margin-bottom:3px">Avg R:R: <strong style="color:var(--cyan)">1:'+_b.toFixed(2)+'</strong></div>'
+        + '<div style="font-size:11px">Full Kelly: <strong style="color:var(--dim)">'+Math.round(_kelly*100)+'%</strong></div>'
+        + '</div></div>'
+        + '<div style="font-size:11px;padding:8px 12px;border-radius:7px;font-weight:600;background:rgba(0,0,0,.2);color:'+_kCol+';border:1px solid '+_kCol+'44">'+_kMsg+'</div>'
+        + '<div style="font-size:10px;color:var(--muted);margin-top:8px">Half-Kelly (industry standard). Full Kelly too volatile in practice. Capped 25%. Based on '+closed.length+' trades.</div>'
+        + '</div>';
+    })()}
+    `;
 }
 
 // ── Historical candle check (when browser was closed) ─────────
