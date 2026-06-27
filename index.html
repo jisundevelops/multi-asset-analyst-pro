@@ -1614,14 +1614,28 @@ async function fetchFearGreed() {
 }
 
 async function fetchLongShortRatio() {
-  for(const base of ['https://fapi.binance.com','https://fapi.binance.us']) {
-    try {
-      const d = await tryFetch(`${base}/futures/data/globalLongShortAccountRatio?symbol=${currentAsset.binanceSymbol}&period=5m&limit=1`, 6000);
-      if(Array.isArray(d) && d.length>0) {
-        return +(d[0].longShortRatio || (d[0].shortAccount > 0 ? d[0].longAccount / d[0].shortAccount : 1)).toFixed(3);
-      }
-    } catch(_){}
-  }
+  // ── ENDPOINT FIX ──────────────────────────────────────────
+  // OLD: tried ['https://fapi.binance.com', 'https://fapi.binance.us']
+  // PROBLEMS:
+  //   1. fapi.binance.us doesn't exist (DNS fails → ERR_* in browser).
+  //      Only api.binance.us exists, and it doesn't serve futures data.
+  //   2. fapi.binance.com is Binance's FUTURES API — often geo-blocked
+  //      in Bangladesh, returning net::ERR_* (connection reset / blocked).
+  //
+  // SOLUTION:
+  //   - Try fapi.binance.com only (the only real futures endpoint).
+  //   - Catch connection errors gracefully and return null (caller handles).
+  //   - The caller already wraps this in a try/catch and treats null as
+  //     "ratio unavailable" — UI shows "—" instead of crashing.
+  try {
+    const d = await tryFetch(
+      `https://fapi.binance.com/futures/data/globalLongShortAccountRatio?symbol=${currentAsset.binanceSymbol}&period=5m&limit=1`,
+      6000, 0  // 6s timeout, 0 retries — fail fast on geo-block
+    );
+    if(Array.isArray(d) && d.length>0) {
+      return +(d[0].longShortRatio || (d[0].shortAccount > 0 ? d[0].longAccount / d[0].shortAccount : 1)).toFixed(3);
+    }
+  } catch(_){}
   return null;
 }
 
@@ -4454,32 +4468,44 @@ function renderHarmonicsLiq(harmonicData, liqSweepData) {
 // ══════════════════════════════════════════════════════════════════
 
 // ── Macro Data Fetching ───────────────────────────────────────
-// SECURITY FIX: Finnhub API key used to be hardcoded in client-side source,
-// visible to anyone viewing DevTools. Anyone could scrape and abuse it,
-// exhausting the free-tier 60 calls/min quota for real users.
+// ARCHITECTURE (re-architected after deployment testing):
 //
-// Now we route through /api/macro.js (Vercel serverless proxy) which holds
-// the key in env var FINNHUB_KEY — same pattern as /api/td for Twelve Data.
-// The proxy also adds a 60-second in-memory cache to cut ~95% of upstream calls.
+//   Initial attempt: routed Finnhub calls through /api/macro.js proxy.
+//   PROBLEM: Finnhub free tier does NOT support indices (VIX, DXY, US10Y, US2Y).
+//   All these symbols returned {price: 0} → useless for the macro panel.
+//
+//   Twelve Data free tier ALSO doesn't support them — returns 404 with
+//   "This symbol is available starting with the Grow or Venture plan".
+//
+//   FINAL SOLUTION: /api/macro.js now fetches from Yahoo Finance's
+//   query2.finance.yahoo.com chart API server-side (with a browser-like
+//   User-Agent header that Yahoo requires). Yahoo free, supports indices,
+//   and the chart endpoint returns OHLC + meta with current price.
+//
+//   Yahoo symbol mappings (server-side):
+//     VIX   → ^VIX          (CBOE Volatility Index)
+//     DXY   → DX-Y.NYB      (ICE US Dollar Index)
+//     US10Y → ^TNX          (CBOE 10-Year Treasury Yield)
+//     US2Y  → ^IRX          (CBOE 13-week — used as 2Y proxy)
+//     US2YR → ^IRX          (alias)
+//
+// fetchFinnhubQuote kept for backward-compat (some non-macro callers may exist)
+// but now routes through the same /api/macro proxy.
 async function fetchFinnhubQuote(symbol) {
   try {
     const d = await tryFetch(
       `/api/macro?symbol=${encodeURIComponent(symbol)}`,
       8000, 1
     );
-    // Proxy normalizes the Finnhub response to { price, prevClose, change, changePct, high, low }.
+    // Proxy normalizes the response to { price, prevClose, change, changePct, high, low, source }.
     if(d && typeof d.price === 'number' && d.price > 0) {
-      const price     = d.price;
-      const prevClose = d.prevClose > 0 ? d.prevClose : price;
-      const changePct = d.changePct !== 0 ? d.changePct :
-                       (prevClose > 0 ? ((price - prevClose) / prevClose * 100) : 0);
       return {
-        price,
-        prevClose,
-        change: price - prevClose,
-        changePct,
-        high: d.high > 0 ? d.high : price,
-        low:  d.low  > 0 ? d.low  : price,
+        price:     d.price,
+        prevClose: d.prevClose > 0 ? d.prevClose : d.price,
+        change:    d.change,
+        changePct: d.changePct,
+        high:      d.high > 0 ? d.high : d.price,
+        low:       d.low  > 0 ? d.low  : d.price,
       };
     }
   } catch(_){}
@@ -4525,7 +4551,9 @@ fetchTwelveQuote = async function(symbol) {
   return result;
 };
 
-// Master macro data fetcher — tries multiple sources with graceful fallbacks
+// Master macro data fetcher — uses /api/macro proxy (Yahoo Finance server-side)
+// for all 4 macro indicators. Previously tried Finnhub→TD fallback chains but
+// neither free tier supports indices (VIX, DXY, US10Y, US2Y all returned 0 or 404).
 async function fetchMacroData() {
   // Return cached macro data if fresh enough (macro data is asset-agnostic)
   const now = Date.now();
@@ -4537,89 +4565,35 @@ async function fetchMacroData() {
     dxy: null,       // US Dollar Index
     vix: null,       // VIX Volatility Index
     yield10: null,   // 10-Year Treasury Yield
-    yield2: null,    // 2-Year Treasury Yield
+    yield2: null,    // 2-Year Treasury Yield (using 13-week as proxy — see comment below)
   };
 
-  // Fetch all macro data in parallel for speed
-  // Each uses Finnhub first, then Twelve Data fallback
+  // Fetch all 4 in parallel — each goes through /api/macro which hits Yahoo Finance.
   const [dxyResult, vixResult, y10Result, y2Result] = await Promise.allSettled([
-    // DXY — prefer Finnhub (DXY supported directly), then Twelve Data (DX/USD),
-    // then EUR/USD-derived approximation as last resort.
-    // Previously tried fetchTwelveQuote('DX-Y.NYB') — that's a Yahoo Finance symbol
-    // that Twelve Data does NOT accept, so the primary path always failed.
-    (async () => {
-      try {
-        const dxyFh = await fetchFinnhubQuote('DXY');
-        if(dxyFh && dxyFh.price > 50 && dxyFh.price < 200) return dxyFh;
-      } catch(_){}
-      try {
-        const dxyQuote = await fetchTwelveQuote('DX/USD');
-        if(dxyQuote && dxyQuote.price > 50) return dxyQuote;
-      } catch(_){}
-      try {
-        const eurusdData = await fetchTwelveQuote('EUR/USD');
-        if(eurusdData && eurusdData.price > 0) {
-          const approxDxy = 100 / eurusdData.price;
-          return {
-            price: +(approxDxy * 1.02).toFixed(2),
-            prevClose: eurusdData.prevClose > 0 ? +(100 / eurusdData.prevClose * 1.02).toFixed(2) : approxDxy,
-            changePct: eurusdData.changePct !== 0 ? -eurusdData.changePct : 0,
-            change: 0, high: approxDxy * 1.005, low: approxDxy * 0.995,
-            derived: true,
-          };
-        }
-      } catch(_){}
-      return null;
-    })(),
-    // VIX
-    (async () => {
-      try {
-        const vixData = await fetchFinnhubQuote('VIX');
-        if(vixData && vixData.price > 5 && vixData.price < 100) return vixData;
-      } catch(_){}
-      try {
-        const vixQuote = await fetchTwelveQuote('VIX');
-        if(vixQuote && vixQuote.price > 5 && vixQuote.price < 100) return vixQuote;
-      } catch(_){}
-      return null;
-    })(),
-    // 10Y Yield
-    (async () => {
-      try {
-        const y10 = await fetchFinnhubQuote('US10Y');
-        if(y10 && y10.price > 0 && y10.price < 10) return { ...y10, price: +y10.price.toFixed(3) };
-      } catch(_){}
-      try {
-        const y10Td = await fetchTwelveQuote('TNX');
-        if(y10Td && y10Td.price > 0 && y10Td.price < 10) return { ...y10Td, price: +y10Td.price.toFixed(3) };
-      } catch(_){}
-      return null;
-    })(),
-    // 2Y Yield — primary Finnhub (US2Y), then Twelve Data (US2YR).
-    // Previously used IRX as the TD fallback — but IRX is the CBOE 13-week (3-month)
-    // Treasury yield, NOT the 2-year. That gave a ~50bp error in the 2Y-10Y
-    // yield spread (a key recession indicator). US2YR is Twelve Data's 2-year symbol.
-    (async () => {
-      try {
-        const y2 = await fetchFinnhubQuote('US2Y');
-        if(y2 && y2.price > 0 && y2.price < 10) return { ...y2, price: +y2.price.toFixed(3) };
-      } catch(_){}
-      try {
-        const y2Td = await fetchTwelveQuote('US2YR');
-        if(y2Td && y2Td.price > 0 && y2Td.price < 10) return { ...y2Td, price: +y2Td.price.toFixed(3) };
-      } catch(_){}
-      return null;
-    })(),
+    fetchFinnhubQuote('DXY'),     // → Yahoo DX-Y.NYB
+    fetchFinnhubQuote('VIX'),     // → Yahoo ^VIX
+    fetchFinnhubQuote('US10Y'),   // → Yahoo ^TNX
+    fetchFinnhubQuote('US2Y'),    // → Yahoo ^IRX (13-week, used as 2Y proxy)
   ]);
 
-  macro.dxy = dxyResult.status === 'fulfilled' ? dxyResult.value : null;
-  macro.vix = vixResult.status === 'fulfilled' ? vixResult.value : null;
+  macro.dxy    = dxyResult.status === 'fulfilled' ? dxyResult.value : null;
+  macro.vix    = vixResult.status === 'fulfilled' ? vixResult.value : null;
   macro.yield10 = y10Result.status === 'fulfilled' ? y10Result.value : null;
-  macro.yield2 = y2Result.status === 'fulfilled' ? y2Result.value : null;
+  macro.yield2  = y2Result.status === 'fulfilled' ? y2Result.value : null;
 
-  // Cache macro data (shared across all assets, not asset-specific)
-  _macroCache = macro;
-  _macroCacheTime = now;
+  // Sanity ranges — reject obviously bogus values (Yahoo occasionally returns 0
+  // during market closed periods or for unsupported symbols).
+  if(macro.dxy    && (macro.dxy.price <= 50    || macro.dxy.price > 200))    macro.dxy    = null;
+  if(macro.vix    && (macro.vix.price <= 5     || macro.vix.price > 100))    macro.vix    = null;
+  if(macro.yield10 && (macro.yield10.price <= 0 || macro.yield10.price > 15)) macro.yield10 = null;
+  if(macro.yield2  && (macro.yield2.price  <= 0 || macro.yield2.price  > 15)) macro.yield2  = null;
+
+  // Only cache if at least one field is non-null — otherwise a transient network
+  // blip would cache all-nulls for the full TTL.
+  if(macro.dxy || macro.vix || macro.yield10 || macro.yield2) {
+    _macroCache = macro;
+    _macroCacheTime = now;
+  }
   return macro;
 }
 
@@ -5825,12 +5799,27 @@ async function fetchOnChainData() {
 
   try {
     // Fetch all on-chain data in parallel for maximum speed
-    const [mempoolStats, diffAdj, mempoolData, feeEst, bcStats, bcTotalBTC, cgData] = await Promise.allSettled([
-      tryFetch('https://mempool.space/api/v1/mining/hashrate', 8000, 1).catch(()=>null),
+    // ── ENDPOINT FIXES ──────────────────────────────────────────
+    // mempool.space API changed:
+    //   OLD: /api/v1/mining/hashrate         → 404 (now requires a time period)
+    //   NEW: /api/v1/mining/hashrate/3d      → works, returns hashrates + difficulty
+    //
+    //   OLD: /api/v1/fees/mempool            → 404 (renamed)
+    //   NEW: /api/v1/fees/mempool-blocks     → works, returns pending blocks
+    //
+    //   /api/v1/mining/difficulty-adjustments → still works (200)
+    //   /api/v1/fees/recommended              → still works (200)
+    //
+    // blockchain.info /q/ endpoints deprecated:
+    //   OLD: /q/txcount              → 404 (removed)
+    //   NEW: /q/24hrtransactioncount → works (returns 24h tx count)
+    //   /q/totalbc                   → still works (200)
+    const [mempoolStats, diffAdj, mempoolBlocks, feeEst, bcStats, bcTotalBTC, cgData] = await Promise.allSettled([
+      tryFetch('https://mempool.space/api/v1/mining/hashrate/3d', 8000, 1).catch(()=>null),
       tryFetch('https://mempool.space/api/v1/mining/difficulty-adjustments', 8000, 1).catch(()=>null),
-      tryFetch('https://mempool.space/api/v1/fees/mempool', 8000, 1).catch(()=>null),
+      tryFetch('https://mempool.space/api/v1/fees/mempool-blocks', 8000, 1).catch(()=>null),
       tryFetch('https://mempool.space/api/v1/fees/recommended', 8000, 1).catch(()=>null),
-      tryFetch('https://blockchain.info/q/txcount', 8000, 1).catch(()=>null),
+      tryFetch('https://blockchain.info/q/24hrtransactioncount', 8000, 1).catch(()=>null),
       tryFetch('https://blockchain.info/q/totalbc', 8000, 1).catch(()=>null),
       (async () => {
         const coinId = CG_COIN_MAP[currentAsset?.binanceSymbol] || 'bitcoin';
@@ -5867,21 +5856,32 @@ async function fetchOnChainData() {
       }
     }
 
-    // Process mempool stats
-    const mpd = mempoolData.status === 'fulfilled' ? mempoolData.value : null;
-    if(mpd && typeof mpd === 'object') {
-      result.mempool.txCount = mpd.count || 0;
-      result.mempool.vSize = mpd.vsize || 0;
-      if(mpd.fee_histogram && Array.isArray(mpd.fee_histogram)) {
-        const fees = mpd.fee_histogram;
-        if(fees.length > 0) {
-          result.mempool.feeRange.min = fees[0]?.[0] || 0;
-          result.mempool.feeRange.max = fees[fees.length - 1]?.[0] || 0;
+    // Process mempool stats (new /fees/mempool-blocks endpoint — array of pending blocks)
+    // Each block has: { blockSize, blockVSize, nTx, totalFees, medianFee, feeRange }
+    // We sum nTx and blockVSize across all pending blocks for total mempool state.
+    const mpb = mempoolBlocks.status === 'fulfilled' ? mempoolBlocks.value : null;
+    if(mpb && Array.isArray(mpb) && mpb.length > 0) {
+      let totalTx = 0, totalVSize = 0;
+      let minFee = Infinity, maxFee = 0;
+      for(const blk of mpb) {
+        totalTx    += blk.nTx || 0;
+        totalVSize += blk.blockVSize || 0;
+        // feeRange is [min, p25, p50, p75, max] in sat/vB
+        if(Array.isArray(blk.feeRange) && blk.feeRange.length > 0) {
+          const blkMin = blk.feeRange[0];
+          const blkMax = blk.feeRange[blk.feeRange.length - 1];
+          if(blkMin < minFee) minFee = blkMin;
+          if(blkMax > maxFee) maxFee = blkMax;
         }
       }
+      result.mempool.txCount = totalTx;
+      result.mempool.vSize   = totalVSize;
+      if(isFinite(minFee)) result.mempool.feeRange.min = minFee;
+      if(maxFee > 0)       result.mempool.feeRange.max = maxFee;
+      // Congestion thresholds (in vSize — total of pending block vSizes)
       const vs = result.mempool.vSize;
-      if(vs > 150000000) result.mempool.congestion = 'high';
-      else if(vs > 80000000) result.mempool.congestion = 'medium';
+      if(vs > 1500000) result.mempool.congestion = 'high';      // ~1.5M vB = ~10+ pending blocks
+      else if(vs > 800000) result.mempool.congestion = 'medium'; // ~5-10 pending blocks
       else result.mempool.congestion = 'low';
     }
 
