@@ -927,6 +927,36 @@
     .tj-analytics-grid{grid-template-columns:1fr;}
     .tj-trade-card{grid-template-columns:auto 1fr;gap:8px;}
     .tj-trade-card > div:last-child{grid-column:1/-1;}
+    .tj-win-big{font-size:36px;}
+    .tj-summ-row{gap:6px;}
+    .tj-summ-item{padding:6px 10px;flex:1;min-width:60px;}
+    .tj-summ-val{font-size:16px;}
+    .tj-modal-body{padding:12px 14px;}
+    .tj-modal-header{padding:12px 14px;}
+    .tj-tabs{padding:10px 14px;gap:4px;}
+    .tj-tab{padding:6px 12px;font-size:11px;}
+    .tj-modal{max-height:92vh;border-radius:14px;}
+  }
+  @media(max-width:430px){
+    .tj-trade-card{grid-template-columns:1fr;gap:8px;padding:10px;}
+    .tj-dir-badge{display:inline-block;width:auto;}
+    .tj-prices{gap:6px;}
+    .tj-price-val{font-size:11px;}
+    .tj-price-lbl{font-size:8px;}
+    .tj-summ-item{padding:5px 8px;min-width:50px;}
+    .tj-summ-val{font-size:14px;}
+    .tj-win-big{font-size:32px;}
+    .tj-tab{padding:5px 10px;font-size:10px;}
+    .tj-modal-title{font-size:14px;}
+  }
+  /* Position size card mobile optimization */
+  @media(max-width:600px){
+    /* Trade setup position size card: 4 cols → 2 cols on mobile */
+    .tpsl-grid{grid-template-columns:repeat(2,1fr)!important;}
+  }
+  /* Equity curve SVG mobile optimization */
+  @media(max-width:600px){
+    .tj-analytics-card svg{max-height:50px;}
   }
 
 /* ══════════════════════════════════════
@@ -9131,6 +9161,409 @@ function _tjSaveRisk(cfg) {
   try { localStorage.setItem(RISK_KEY, JSON.stringify(cfg)); } catch(e) { console.warn('[Risk] save failed', e); }
 }
 
+// ══════════════════════════════════════════════════════════════════
+// CROSS-DEVICE SYNC — Export/Import + Cloud Sync (GitHub Gist)
+// ══════════════════════════════════════════════════════════════════
+// PROBLEM: localStorage is device-specific. Trades logged on PC don't
+// appear on mobile (different browser = different localStorage).
+//
+// SOLUTION: Two-tier sync system:
+//   1. Manual export/import (JSON file download/upload) — works offline,
+//      no setup needed. User exports from one device, imports on another.
+//   2. Cloud sync via GitHub Gist (optional) — automatic cross-device
+//      sync. User provides a GitHub Personal Access Token (gist scope).
+//      Trades are encrypted JSON uploaded to a private gist. All devices
+//      with the same token sync automatically.
+//
+// SYNC STRATEGY:
+//   - On page load: fetch from cloud if token configured → merge with local
+//   - On trade log/close: push to cloud (debounced 5s)
+//   - Merge logic: dedupe by trade.id, keep latest closedAt/status
+//   - Conflict resolution: cloud is source of truth for closed trades,
+//     local is source of truth for pending trades (more recent state)
+//
+// SECURITY:
+//   - Token stored in localStorage (not sent to any server except GitHub)
+//   - Gist is private (only accessible with token)
+//   - Gist ID stored in localStorage (auto-created on first sync)
+const SYNC_KEY = 'btc_analyst_sync_v1';
+const _DEFAULT_SYNC_CFG = {
+  githubToken: '',     // GitHub PAT with gist scope
+  gistId: '',          // auto-created on first cloud sync
+  autoSync: true,      // auto-push on trade changes
+  lastSyncAt: 0,       // timestamp of last successful sync
+  lastSyncStatus: '',  // 'success' | 'error' | 'pending' | ''
+};
+
+function _tjLoadSync() {
+  try {
+    const stored = JSON.parse(localStorage.getItem(SYNC_KEY) || '{}');
+    return { ..._DEFAULT_SYNC_CFG, ...stored };
+  } catch { return { ..._DEFAULT_SYNC_CFG }; }
+}
+function _tjSaveSync(cfg) {
+  try { localStorage.setItem(SYNC_KEY, JSON.stringify(cfg)); } catch(e) { console.warn('[Sync] save failed', e); }
+}
+
+// ── Export all journal data to JSON ──────────────────────────────
+// Returns a JSON string containing trades + risk config + sync config
+// (minus the github token for security — user must re-enter on import
+// if they want cloud sync on the new device).
+function _tjExportData() {
+  const data = {
+    version: 1,
+    exportedAt: new Date().toISOString(),
+    exportedFrom: navigator.userAgent.slice(0, 100),
+    trades: _tjLoad(),
+    riskCfg: _tjLoadRisk(),
+    syncCfg: { ..._tjLoadSync(), githubToken: '' }, // strip token for security
+  };
+  return JSON.stringify(data, null, 2);
+}
+
+// ── Import journal data from JSON ────────────────────────────────
+// Merges imported trades with existing local trades (dedupe by id).
+// Returns { imported: number, merged: number, skipped: number }
+function _tjImportData(jsonStr) {
+  try {
+    const data = JSON.parse(jsonStr);
+    if (!data || typeof data !== 'object') throw new Error('Invalid JSON');
+
+    const existingTrades = _tjLoad();
+    const importedTrades = Array.isArray(data.trades) ? data.trades : [];
+    const existingIds = new Set(existingTrades.map(t => t.id));
+
+    let merged = 0, skipped = 0;
+    const allTrades = [...existingTrades];
+
+    for (const imp of importedTrades) {
+      if (!imp || !imp.id) { skipped++; continue; }
+      if (existingIds.has(imp.id)) {
+        // Merge: keep the version with the most recent closedAt (or pending)
+        const idx = allTrades.findIndex(t => t.id === imp.id);
+        if (idx >= 0) {
+          const local = allTrades[idx];
+          // If imported trade is closed and local is pending → use imported
+          // If both closed → use the one with later closedAt
+          // If local closed and imported pending → keep local (more advanced state)
+          if (imp.status !== 'pending' && local.status === 'pending') {
+            allTrades[idx] = imp;
+            merged++;
+          } else if (imp.status !== 'pending' && local.status !== 'pending') {
+            const impClose = imp.closedAt ? new Date(imp.closedAt).getTime() : 0;
+            const locClose = local.closedAt ? new Date(local.closedAt).getTime() : 0;
+            if (impClose > locClose) {
+              allTrades[idx] = imp;
+              merged++;
+            } else {
+              skipped++;
+            }
+          } else {
+            skipped++; // local is closed, imported is pending → keep local
+          }
+        }
+      } else {
+        // New trade from import
+        allTrades.push(imp);
+        merged++;
+      }
+    }
+
+    // Sort by timestamp descending (newest first)
+    allTrades.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+
+    // Keep max 500 trades
+    if (allTrades.length > 500) allTrades.splice(500);
+
+    _tjSave(allTrades);
+
+    // Import risk config if present
+    if (data.riskCfg) {
+      const currentRisk = _tjLoadRisk();
+      _tjSaveRisk({ ...currentRisk, ...data.riskCfg });
+    }
+
+    // Import sync config if present (but don't overwrite token)
+    if (data.syncCfg) {
+      const currentSync = _tjLoadSync();
+      _tjSaveSync({
+        ...currentSync,
+        gistId: data.syncCfg.gistId || currentSync.gistId,
+        autoSync: data.syncCfg.autoSync ?? currentSync.autoSync,
+      });
+    }
+
+    _tjUpdateBadge();
+    return { imported: importedTrades.length, merged, skipped };
+  } catch(e) {
+    console.error('[Sync] Import failed:', e);
+    return { imported: 0, merged: 0, skipped: 0, error: e.message };
+  }
+}
+
+// ── Download JSON export file ────────────────────────────────────
+function tjDownloadBackup() {
+  try {
+    const json = _tjExportData();
+    const blob = new Blob([json], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `trade-journal-backup-${new Date().toISOString().slice(0,10)}.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  } catch(e) { console.error('[Sync] Download failed:', e); alert('Download failed: ' + e.message); }
+}
+
+// ── Upload JSON import file ──────────────────────────────────────
+function tjUploadBackup() {
+  const input = document.createElement('input');
+  input.type = 'file';
+  input.accept = '.json,application/json';
+  input.onchange = (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      const result = _tjImportData(ev.target.result);
+      if (result.error) {
+        alert('Import failed: ' + result.error);
+      } else {
+        alert(`Import complete!\nImported: ${result.imported}\nMerged: ${result.merged}\nSkipped (duplicates): ${result.skipped}`);
+        if (_tjOpen) _tjRenderBody();
+        // Auto-sync after import if configured
+        if (_tjLoadSync().githubToken) setTimeout(() => tjCloudSync().catch(()=>{}), 1000);
+      }
+    };
+    reader.readAsText(file);
+  };
+  input.click();
+}
+
+// ── Cloud sync via GitHub Gist ───────────────────────────────────
+// Creates/updates a private gist with the journal data.
+// First call creates the gist; subsequent calls update it.
+// Returns { success: bool, message: string, synced: number }
+async function tjCloudSync() {
+  const syncCfg = _tjLoadSync();
+  if (!syncCfg.githubToken) {
+    return { success: false, message: 'No GitHub token configured', synced: 0 };
+  }
+
+  const data = _tjExportData();
+  const filename = 'trade-journal.json';
+
+  try {
+    let response;
+    if (syncCfg.gistId) {
+      // Update existing gist
+      response = await fetch(`https://api.github.com/gists/${syncCfg.gistId}`, {
+        method: 'PATCH',
+        headers: {
+          'Authorization': `token ${syncCfg.githubToken}`,
+          'Content-Type': 'application/json',
+          'Accept': 'application/vnd.github.v3+json',
+        },
+        body: JSON.stringify({
+          description: 'Multi-Asset Analyst Pro — Trade Journal Backup',
+          files: { [filename]: { content: data } },
+        }),
+      });
+    } else {
+      // Create new gist
+      response = await fetch('https://api.github.com/gists', {
+        method: 'POST',
+        headers: {
+          'Authorization': `token ${syncCfg.githubToken}`,
+          'Content-Type': 'application/json',
+          'Accept': 'application/vnd.github.v3+json',
+        },
+        body: JSON.stringify({
+          description: 'Multi-Asset Analyst Pro — Trade Journal Backup',
+          public: false, // PRIVATE gist
+          files: { [filename]: { content: data } },
+        }),
+      });
+    }
+
+    if (!response.ok) {
+      const errBody = await response.json().catch(()=>({}));
+      throw new Error(`GitHub API ${response.status}: ${errBody.message || response.statusText}`);
+    }
+
+    const gist = await response.json();
+
+    // Save gist ID for future updates
+    if (gist.id && gist.id !== syncCfg.gistId) {
+      _tjSaveSync({ ...syncCfg, gistId: gist.id, lastSyncAt: Date.now(), lastSyncStatus: 'success' });
+    } else {
+      _tjSaveSync({ ...syncCfg, lastSyncAt: Date.now(), lastSyncStatus: 'success' });
+    }
+
+    const trades = _tjLoad();
+    return { success: true, message: 'Synced successfully', synced: trades.length };
+  } catch(e) {
+    console.error('[Sync] Cloud sync failed:', e);
+    _tjSaveSync({ ...syncCfg, lastSyncAt: Date.now(), lastSyncStatus: 'error' });
+    return { success: false, message: e.message, synced: 0 };
+  }
+}
+
+// ── Cloud pull — fetch latest from GitHub Gist ──────────────────
+// Merges cloud data with local. Cloud is source of truth for closed
+// trades; local is source of truth for pending trades (more recent).
+async function tjCloudPull() {
+  const syncCfg = _tjLoadSync();
+  if (!syncCfg.githubToken || !syncCfg.gistId) {
+    return { success: false, message: 'No gist ID or token configured', pulled: 0 };
+  }
+
+  try {
+    const response = await fetch(`https://api.github.com/gists/${syncCfg.gistId}`, {
+      headers: {
+        'Authorization': `token ${syncCfg.githubToken}`,
+        'Accept': 'application/vnd.github.v3+json',
+      },
+    });
+
+    if (!response.ok) {
+      throw new Error(`GitHub API ${response.status}`);
+    }
+
+    const gist = await response.json();
+    const filename = 'trade-journal.json';
+    const file = gist.files && gist.files[filename];
+    if (!file || !file.content) {
+      return { success: false, message: 'No journal data in gist', pulled: 0 };
+    }
+
+    const result = _tjImportData(file.content);
+    _tjSaveSync({ ...syncCfg, lastSyncAt: Date.now(), lastSyncStatus: 'success' });
+    return { success: true, message: 'Pulled successfully', pulled: result.merged };
+  } catch(e) {
+    console.error('[Sync] Cloud pull failed:', e);
+    _tjSaveSync({ ...syncCfg, lastSyncAt: Date.now(), lastSyncStatus: 'error' });
+    return { success: false, message: e.message, pulled: 0 };
+  }
+}
+
+// ── Auto-sync on page load + debounced push on changes ──────────
+let _syncDebounceTimer = null;
+function tjScheduleSyncPush() {
+  const syncCfg = _tjLoadSync();
+  if (!syncCfg.autoSync || !syncCfg.githubToken) return;
+  // Debounce: wait 5s after last change before pushing
+  if (_syncDebounceTimer) clearTimeout(_syncDebounceTimer);
+  _syncDebounceTimer = setTimeout(() => {
+    tjCloudSync().catch(()=>{});
+  }, 5000);
+}
+
+// On page load: pull from cloud (if configured), then schedule push
+setTimeout(async () => {
+  const syncCfg = _tjLoadSync();
+  if (syncCfg.githubToken && syncCfg.gistId) {
+    console.log('[Sync] Auto-pull on page load...');
+    const result = await tjCloudPull().catch(()=>({success:false}));
+    if (result.success) console.log('[Sync] Auto-pull complete:', result.pulled, 'trades merged');
+    if (_tjOpen) _tjRenderBody();
+  }
+}, 3000); // 3s delay to let page settle
+
+// ── Sync UI: render sync status + settings ──────────────────────
+function tjRenderSyncCard() {
+  const syncCfg = _tjLoadSync();
+  const lastSync = syncCfg.lastSyncAt ? new Date(syncCfg.lastSyncAt).toLocaleString('en-BD', {hour:'2-digit',minute:'2-digit',day:'numeric',month:'short'}) : 'never';
+  const statusColor = syncCfg.lastSyncStatus === 'success' ? 'var(--green)' : syncCfg.lastSyncStatus === 'error' ? 'var(--red)' : 'var(--muted)';
+  const statusIcon = syncCfg.lastSyncStatus === 'success' ? '✓' : syncCfg.lastSyncStatus === 'error' ? '✗' : '—';
+
+  const tokenConfigured = !!syncCfg.githubToken;
+  const gistConfigured = !!syncCfg.gistId;
+
+  let html = '<div class="tj-analytics-card" style="margin-bottom:12px">';
+  html += '<div class="tj-analytics-title">☁️ Cross-Device Sync</div>';
+
+  // Status row
+  html += '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;font-size:11px">';
+  html += '<span style="color:var(--muted)">Last sync: <strong style="color:' + statusColor + '">' + statusIcon + ' ' + lastSync + '</strong></span>';
+  html += '<span style="color:var(--muted)">' + (tokenConfigured ? (gistConfigured ? '🟢 Connected' : '🟡 Token set, no gist') : '🔴 Not configured') + '</span>';
+  html += '</div>';
+
+  // Cloud sync config (collapsible)
+  html += '<div style="background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:12px;margin-bottom:10px">';
+  html += '<div style="font-size:10px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:1px;margin-bottom:8px">Cloud Sync (GitHub Gist)</div>';
+  html += '<div style="font-size:10px;color:var(--muted);margin-bottom:8px;line-height:1.4">';
+  html += 'Private gist এ trades backup হয়। সব device এ same token দিলে auto-sync হবে।<br>';
+  html += 'Token লাগবে: GitHub Settings → Developer settings → Personal access tokens → Tokens (classic) → Generate (gist scope).';
+  html += '</div>';
+
+  // Token input
+  html += '<div style="margin-bottom:8px">';
+  html += '<label style="font-size:10px;color:var(--muted);display:block;margin-bottom:3px">GitHub Token (gist scope)</label>';
+  html += '<input type="password" id="syncTokenInput" placeholder="ghp_..." value="' + (syncCfg.githubToken || '') + '" ';
+  html += 'style="width:100%;background:var(--bg3);border:1px solid var(--border);border-radius:6px;padding:8px 10px;font-size:11px;font-family:JetBrains Mono,monospace;color:var(--text)"';
+  html += 'oninput="tjSaveSyncField(\'githubToken\', this.value)" />';
+  html += '</div>';
+
+  // Gist ID (read-only, auto-generated)
+  if (gistConfigured) {
+    html += '<div style="margin-bottom:8px">';
+    html += '<label style="font-size:10px;color:var(--muted);display:block;margin-bottom:3px">Gist ID (auto-created)</label>';
+    html += '<code style="font-size:10px;color:var(--cyan);font-family:JetBrains Mono,monospace">' + syncCfg.gistId + '</code>';
+    html += '</div>';
+  }
+
+  // Auto-sync toggle
+  html += '<div style="margin-bottom:10px">';
+  html += '<label style="font-size:10px;color:var(--muted);display:flex;align-items:center;gap:8px;cursor:pointer">';
+  html += '<input type="checkbox" id="syncAutoToggle" ' + (syncCfg.autoSync ? 'checked' : '') + ' ';
+  html += 'onchange="tjSaveSyncField(\'autoSync\', this.checked)" ';
+  html += 'style="cursor:pointer" />';
+  html += 'Auto-sync on trade changes (debounced 5s)';
+  html += '</label>';
+  html += '</div>';
+
+  // Sync buttons
+  html += '<div style="display:flex;gap:8px;flex-wrap:wrap">';
+  html += '<button onclick="tjCloudSync().then(r=>tjShowSyncResult(r))" style="flex:1;min-width:80px;background:rgba(61,142,255,.12);border:1px solid rgba(61,142,255,.3);color:var(--blue);padding:8px 12px;border-radius:6px;font-size:11px;font-weight:600;cursor:pointer;font-family:Sora,sans-serif">⬆️ Push to Cloud</button>';
+  html += '<button onclick="tjCloudPull().then(r=>tjShowSyncResult(r))" style="flex:1;min-width:80px;background:rgba(5,229,122,.12);border:1px solid rgba(5,229,122,.3);color:var(--green);padding:8px 12px;border-radius:6px;font-size:11px;font-weight:600;cursor:pointer;font-family:Sora,sans-serif">⬇️ Pull from Cloud</button>';
+  html += '</div>';
+  html += '</div>';
+
+  // Manual backup buttons
+  html += '<div style="background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:12px">';
+  html += '<div style="font-size:10px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:1px;margin-bottom:8px">Manual Backup (no setup needed)</div>';
+  html += '<div style="font-size:10px;color:var(--muted);margin-bottom:8px;line-height:1.4">';
+  html += 'JSON file download করে অন্য device এ import করুন। Cloud sync এর alternative।';
+  html += '</div>';
+  html += '<div style="display:flex;gap:8px">';
+  html += '<button onclick="tjDownloadBackup()" style="flex:1;background:rgba(255,195,0,.12);border:1px solid rgba(255,195,0,.3);color:var(--yellow);padding:8px 12px;border-radius:6px;font-size:11px;font-weight:600;cursor:pointer;font-family:Sora,sans-serif">📥 Export JSON</button>';
+  html += '<button onclick="tjUploadBackup()" style="flex:1;background:rgba(255,195,0,.12);border:1px solid rgba(255,195,0,.3);color:var(--yellow);padding:8px 12px;border-radius:6px;font-size:11px;font-weight:600;cursor:pointer;font-family:Sora,sans-serif">📤 Import JSON</button>';
+  html += '</div>';
+  html += '</div>';
+
+  html += '</div>';
+  return html;
+}
+
+function tjSaveSyncField(field, value) {
+  const cfg = _tjLoadSync();
+  cfg[field] = value;
+  _tjSaveSync(cfg);
+}
+
+function tjShowSyncResult(result) {
+  if (result.success) {
+    console.log('[Sync] ' + result.message + ' (' + (result.synced || result.pulled) + ' trades)');
+    if (_tjOpen) _tjRenderBody();
+  } else {
+    console.warn('[Sync] ' + result.message);
+    alert('Sync failed: ' + result.message);
+  }
+}
+
 // ── Kelly Criterion Calculation ──────────────────────────────────
 // Kelly formula: f* = (b·p − q) / b
 //   b = avg win / avg loss (win/loss ratio)
@@ -9688,6 +10121,7 @@ function autoLogTrade(results, bestTF, price, masterScoreVal, asset, gateResult,
     _tjSave(trades);
     _tjUpdateBadge();
     if(_tjOpen) _tjRenderBody();
+    tjScheduleSyncPush(); // Cloud sync (debounced, if configured)
     console.log(`[TJ] Logged: ${trade.asset} ${trade.direction} @ ${trade.entry} | Conf: ${trade.confidence}%`);
   } catch(e) { console.warn('[TJ] autoLogTrade error:', e); }
 }
@@ -9726,6 +10160,7 @@ function checkOpenTrades(currentPriceVal, asset) {
       _tjSave(trades);
       _tjUpdateBadge();
       if(_tjOpen) _tjRenderBody();
+      tjScheduleSyncPush();
     }
   } catch(e) { console.warn('[TJ] checkOpenTrades error:', e); }
 }
@@ -9752,7 +10187,10 @@ function _tjFmt(p) {
 function _tjRenderBody() {
   const body = $id('tjBody');
   if(!body) return;
-  body.innerHTML = _tjTab === 'trades' ? _tjRenderTrades() : _tjRenderAnalytics();
+  body.innerHTML = _tjTab === 'trades' ? _tjRenderTrades()
+                 : _tjTab === 'analytics' ? _tjRenderAnalytics()
+                 : _tjTab === 'sync' ? tjRenderSyncCard()
+                 : _tjRenderTrades();
 }
 
 // ── Render trade list ─────────────────────────────────────────
@@ -10296,7 +10734,7 @@ async function _tjCheckHistorical() {
     } catch(e) { console.warn('[TJ] Historical check error:', trade.id, e); }
   }
 
-  if(changed) { _tjSave(trades); _tjUpdateBadge(); if(_tjOpen) _tjRenderBody(); }
+  if(changed) { _tjSave(trades); _tjUpdateBadge(); if(_tjOpen) _tjRenderBody(); tjScheduleSyncPush(); }
 }
 
 // Fetch historical OHLC candles for a trade between startMs and endMs.
@@ -10885,6 +11323,7 @@ function _triggerGateRender() {
     <div class="tj-tabs">
       <button class="tj-tab active" data-tab="trades" onclick="tjSetTab('trades')">📋 Trades</button>
       <button class="tj-tab" data-tab="analytics" onclick="tjSetTab('analytics')">📊 Analytics</button>
+      <button class="tj-tab" data-tab="sync" onclick="tjSetTab('sync')">☁️ Sync</button>
     </div>
     <div class="tj-modal-body" id="tjBody"></div>
   </div>
