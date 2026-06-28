@@ -14,6 +14,10 @@
       "use": "@vercel/node"
     },
     {
+      "src": "api/ai-analysis.js",
+      "use": "@vercel/node"
+    },
+    {
       "src": "index.html",
       "use": "@vercel/static"
     }
@@ -30,6 +34,10 @@
     {
       "src": "/api/news",
       "dest": "/api/news.js"
+    },
+    {
+      "src": "/api/ai-analysis",
+      "dest": "/api/ai-analysis.js"
     },
     {
       "src": "/(.*)",

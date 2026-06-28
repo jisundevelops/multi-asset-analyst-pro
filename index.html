@@ -959,6 +959,56 @@
     .tj-analytics-card svg{max-height:50px;}
   }
 
+  /* ── AI SMART MONEY ANALYSIS ──────────────────────────────── */
+  .ai-btn{position:fixed;bottom:190px;right:16px;z-index:1000;width:48px;height:48px;
+    border-radius:14px;border:1px solid rgba(168,85,247,.4);
+    background:rgba(8,11,20,.92);backdrop-filter:blur(12px);
+    color:#a855f7;font-size:22px;cursor:pointer;
+    display:flex;align-items:center;justify-content:center;
+    box-shadow:0 4px 20px rgba(168,85,247,.3);transition:all .2s;padding:0;}
+  .ai-btn:hover{background:rgba(168,85,247,.15);border-color:rgba(168,85,247,.6);transform:scale(1.05);}
+  .ai-overlay{position:fixed;inset:0;z-index:9999;display:flex;align-items:center;justify-content:center;
+    background:rgba(3,4,10,.75);backdrop-filter:blur(6px);opacity:0;pointer-events:none;transition:opacity .25s;}
+  .ai-overlay.open{opacity:1;pointer-events:all;}
+  .ai-modal{background:var(--bg2);border:1px solid var(--border2);border-radius:18px;
+    width:min(720px,96vw);max-height:88vh;display:flex;flex-direction:column;overflow:hidden;
+    box-shadow:0 20px 60px rgba(0,0,0,.7);}
+  .ai-modal-header{display:flex;align-items:center;justify-content:space-between;
+    padding:16px 20px;border-bottom:1px solid var(--border);gap:10px;flex-shrink:0;}
+  .ai-modal-title{font-size:16px;font-weight:700;background:linear-gradient(90deg,#a855f7,#6366f1);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;}
+  .ai-modal-close{background:none;border:none;color:var(--muted);font-size:20px;cursor:pointer;
+    padding:4px 8px;border-radius:6px;transition:color .2s;line-height:1;}
+  .ai-modal-close:hover{color:var(--text);}
+  .ai-modal-body{overflow-y:auto;padding:16px 20px;flex:1;}
+  .ai-run-btn{background:linear-gradient(135deg,rgba(168,85,247,.2),rgba(99,102,241,.15));
+    border:1px solid rgba(168,85,247,.4);color:#c084fc;padding:10px 24px;border-radius:10px;
+    font-size:14px;font-weight:700;cursor:pointer;transition:all .2s;font-family:'Sora',sans-serif;}
+  .ai-run-btn:hover{background:linear-gradient(135deg,rgba(168,85,247,.3),rgba(99,102,241,.25));transform:scale(1.03);}
+  .ai-run-btn:disabled{opacity:.5;cursor:not-allowed;transform:none;}
+  .ai-analyst-card{background:var(--bg3);border:1px solid var(--border);border-radius:12px;
+    padding:14px;margin-bottom:10px;border-left:3px solid var(--muted);}
+  .ai-analyst-card.take{border-left-color:var(--green);}
+  .ai-analyst-card.skip{border-left-color:var(--red);}
+  .ai-analyst-card.wait{border-left-color:var(--yellow);}
+  .ai-analyst-card.error{border-left-color:var(--red);opacity:.7;}
+  .ai-master-card{background:linear-gradient(135deg,rgba(168,85,247,.08),rgba(99,102,241,.05));
+    border:2px solid rgba(168,85,247,.3);border-radius:14px;padding:18px;margin-bottom:12px;}
+  .ai-verdict-badge{display:inline-block;padding:4px 12px;border-radius:6px;font-size:12px;font-weight:800;letter-spacing:.5px;}
+  .ai-verdict-badge.take{background:rgba(5,229,122,.15);color:var(--green);border:1px solid rgba(5,229,122,.3);}
+  .ai-verdict-badge.skip{background:rgba(255,45,85,.12);color:var(--red);border:1px solid rgba(255,45,85,.25);}
+  .ai-verdict-badge.wait{background:rgba(255,195,0,.12);color:var(--yellow);border:1px solid rgba(255,195,0,.25);}
+  .ai-loading-dots{display:inline-block;}
+  .ai-loading-dots span{display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--purple);
+    margin:0 2px;animation:aiBounce 1.4s infinite ease-in-out both;}
+  .ai-loading-dots span:nth-child(1){animation-delay:-.32s;}
+  .ai-loading-dots span:nth-child(2){animation-delay:-.16s;}
+  @keyframes aiBounce{0%,80%,100%{transform:scale(0);}40%{transform:scale(1);}}
+  @media(max-width:600px){
+    .ai-modal{max-height:92vh;border-radius:14px;}
+    .ai-modal-body{padding:12px 14px;}
+    .ai-btn{bottom:190px;}
+  }
+
 /* ══════════════════════════════════════
    5-GATE TRADE FILTER STYLES
    ══════════════════════════════════════ */
@@ -11448,6 +11498,336 @@ function _triggerGateRender() {
     console.warn('[GateFilter] Error:', e);
   }
 }
+
+/* ══════════════════════════════════════════════════════════════════
+   MULTI-AGENT SMART MONEY AI ANALYSIS SYSTEM
+   ══════════════════════════════════════════════════════════════════
+   3 independent analyst AIs (Gemini + DeepSeek + Groq) + 1 Master AI
+   All use smart money / institutional mindset (not retail thinking).
+
+   Architecture:
+     1. buildAISnapshot() — collects ALL dashboard data into JSON
+     2. POST /api/ai-analysis — proxy calls 3 AIs in parallel + Master
+     3. renderAIResults() — displays 3 analyst cards + master verdict
+   ══════════════════════════════════════════════════════════════════ */
+
+let _aiModalOpen = false;
+let _aiResults = null;
+
+// ── Toggle AI modal ─────────────────────────────────────────────
+function aiToggle() {
+  _aiModalOpen = !_aiModalOpen;
+  const ov = $id('aiOverlay');
+  if(ov) ov.classList.toggle('open', _aiModalOpen);
+}
+
+// ── Build comprehensive data snapshot from ALL dashboard features ──
+function buildAISnapshot() {
+  const s = {};
+  try {
+    // Asset + price
+    s.asset = currentAsset?.displayName || 'unknown';
+    s.assetType = currentAsset?.type || 'crypto';
+    s.price = currentPrice || 0;
+    s.bestTF = typeof bestTF !== 'undefined' ? bestTF : 'unknown';
+
+    // Get results from dashboard cache (most reliable)
+    const dc = dashboardCache[currentAsset?.symbol];
+    const results = dc?.results || {};
+    const bestR = results[s.bestTF] || {};
+
+    // Master score
+    s.masterScore = typeof masterScore !== 'undefined' ? masterScore : 50;
+    s.regime = bestR.regime || 'unknown';
+
+    // Best TF signal
+    s.signal = bestR.signal || 'neutral';
+    s.confidence = bestR.prob || 0;
+    s.bullPct = bestR.bullPct || 50;
+    s.bearPct = bestR.bearPct || 50;
+
+    // TP/SL
+    s.tp1 = bestR.tp1 || null;
+    s.tp2 = bestR.tp2 || null;
+    s.sl = bestR.sl || null;
+    s.atr = bestR.atr || null;
+
+    // Key indicators (bestTF)
+    s.rsi = bestR.rsi || null;
+    s.stoch = bestR.stoch || null;
+    s.macd = bestR.macd ? { positive: bestR.macd.positive, hist: bestR.macd.hist } : null;
+    s.adx = bestR.adx ? { adx: bestR.adx.adx, plusDI: bestR.adx.plusDI, minusDI: bestR.adx.minusDI, regime: bestR.adx.regime } : null;
+    s.ichimoku = bestR.ichimoku ? { signal: bestR.ichimoku.signal, aboveCloud: bestR.ichimoku.aboveCloud } : null;
+    s.bb = bestR.bb ? { upper: bestR.bb.upper, lower: bestR.bb.lower, middle: bestR.bb.middle } : null;
+    s.zScore = bestR.zScore || null;
+    s.hurst = bestR.hurst ? { regime: bestR.hurst.regime, value: bestR.hurst.value } : null;
+    s.supertrend = bestR.supertrend ? { signal: bestR.supertrend.signal } : null;
+    s.sar = bestR.sar ? { signal: bestR.sar.signal } : null;
+    s.cci = bestR.cci ? { signal: bestR.cci.signal, value: bestR.cci.value } : null;
+    s.mfi = bestR.mfi ? { signal: bestR.mfi.signal, value: bestR.mfi.value } : null;
+    s.williamsR = bestR.williamsR ? { signal: bestR.williamsR.signal } : null;
+
+    // Multi-TF confluence (all 6 TFs)
+    s.mtfConfluence = {};
+    for(const tf of TIMEFRAMES) {
+      const r = results[tf.label];
+      if(r) s.mtfConfluence[tf.label] = { signal: r.signal, prob: r.prob, rsi: r.rsi };
+    }
+
+    // HTF bias
+    s.htfBias = results._htfBias || 'neutral';
+
+    // Volume
+    s.volumeTrend = bestR.volumeTrend || 1;
+    s.hasVolume = currentAsset?.type === 'crypto';
+
+    // Macro data
+    if(typeof macroData !== 'undefined' && macroData) {
+      s.macro = {
+        dxy: macroData.dxy?.price || null,
+        vix: macroData.vix?.price || null,
+        yield10: macroData.yield10?.price || null,
+        yield2: macroData.yield2?.price || null,
+      };
+    }
+
+    // Cross-asset correlations (top 3)
+    if(typeof crossAssetCorrelations !== 'undefined' && Array.isArray(crossAssetCorrelations)) {
+      s.crossAsset = crossAssetCorrelations.slice(0, 3).map(c => ({
+        asset: c.asset, correlation: c.correlation, strength: c.strength
+      }));
+    }
+
+    // On-chain (BTC only)
+    if(typeof onChainData !== 'undefined' && onChainData && currentAsset?.type === 'crypto') {
+      s.onchain = {
+        hashRate: onChainData.hashRateEH,
+        hashRateTrend: onChainData.hashRateTrend,
+        difficulty: onChainData.difficulty,
+        diffTrend: onChainData.diffTrend,
+        mempoolCongestion: onChainData.mempool?.congestion,
+        sentiment: onChainData.onchainSentiment,
+      };
+    }
+
+    // Sentiment
+    if(typeof sentiment !== 'undefined' && sentiment) {
+      s.sentiment = {
+        fearGreed: sentiment.fearGreed,
+        longShortRatio: sentiment.longShortRatio,
+        btcDominance: sentiment.dominance,
+        overall: sentiment.overallSentiment,
+      };
+    }
+
+    // Backtest metrics
+    if(typeof btResults !== 'undefined' && btResults?.metrics) {
+      s.backtest = {
+        winRate: btResults.metrics.winRate,
+        profitFactor: btResults.metrics.profitFactor,
+        totalTrades: btResults.metrics.totalTrades,
+        signalAccuracy: btResults.metrics.signalAccuracy,
+        maxDrawdownPct: btResults.metrics.maxDrawdownPct,
+      };
+    }
+
+    // Predictive range
+    if(typeof predictive !== 'undefined' && predictive) {
+      s.predictive = {
+        range1h: predictive.range1h,
+        range24h: predictive.range24h,
+        confidenceLevel: predictive.confidenceLevel,
+      };
+    }
+
+    // Market phase / anomaly
+    if(typeof aiEngineData !== 'undefined' && aiEngineData) {
+      s.aiEngine = {
+        aiScore: aiEngineData.aiScore,
+        bayesianConfidence: aiEngineData.bayesian?.confidence,
+        marketPhase: aiEngineData.marketPhase?.phase,
+        anomalyScore: aiEngineData.anomalies?.anomalyScore,
+      };
+    }
+
+    // Gate filter result
+    if(typeof gateResult !== 'undefined' && gateResult) {
+      s.gateFilter = {
+        strictPassed: gateResult.strictPassed,
+        verdict: gateResult.gates?.map(g => g.name + ':' + g.cls).join(', '),
+      };
+    }
+
+  } catch(e) {
+    console.warn('[AI Snapshot] Error collecting data:', e);
+  }
+  return s;
+}
+
+// ── Run AI Analysis ─────────────────────────────────────────────
+async function runAIAnalysis() {
+  const body = $id('aiBody');
+  const btn = $id('aiRunBtn');
+  if(!body) return;
+  if(btn) btn.disabled = true;
+
+  // Check if analysis has been run
+  if(!currentPrice || currentPrice === 0) {
+    body.innerHTML = '<div style="text-align:center;padding:30px;color:var(--yellow)">⚠️ Run analysis first — no data available.</div>';
+    if(btn) btn.disabled = false;
+    return;
+  }
+
+  // Show loading state
+  body.innerHTML = `
+    <div style="text-align:center;padding:30px 20px">
+      <div style="font-size:40px;margin-bottom:16px">🧠</div>
+      <div style="font-size:14px;font-weight:700;color:var(--text);margin-bottom:12px">Smart Money AI Analysis Running</div>
+      <div style="font-size:12px;color:var(--muted);margin-bottom:20px">
+        3 AI agents analyzing with institutional mindset<span class="ai-loading-dots"><span></span><span></span><span></span></span>
+      </div>
+      <div style="display:flex;gap:12px;justify-content:center;flex-wrap:wrap">
+        <div id="aiStatusGemini" style="padding:8px 16px;border-radius:8px;background:var(--bg3);border:1px solid var(--border);font-size:11px;color:var(--muted)">🔵 Gemini <span style="color:var(--yellow)">⏳</span></div>
+        <div id="aiStatusDeepSeek" style="padding:8px 16px;border-radius:8px;background:var(--bg3);border:1px solid var(--border);font-size:11px;color:var(--muted)">🟣 DeepSeek <span style="color:var(--yellow)">⏳</span></div>
+        <div id="aiStatusGroq" style="padding:8px 16px;border-radius:8px;background:var(--bg3);border:1px solid var(--border);font-size:11px;color:var(--muted)">🟢 Groq <span style="color:var(--yellow)">⏳</span></div>
+      </div>
+      <div id="aiStatusMaster" style="margin-top:12px;padding:8px 16px;border-radius:8px;background:rgba(168,85,247,.08);border:1px solid rgba(168,85,247,.2);font-size:11px;color:var(--muted);display:inline-block">👑 Master AI <span style="color:var(--muted)">⏸️ waiting</span></div>
+    </div>`;
+
+  try {
+    // Build snapshot
+    const snapshot = buildAISnapshot();
+    console.log('[AI] Snapshot built:', Object.keys(snapshot).length, 'fields');
+
+    // Call proxy
+    const response = await fetch('/api/ai-analysis', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ snapshot }),
+    });
+
+    if(!response.ok) {
+      const errText = await response.text().catch(()=> '');
+      throw new Error(`HTTP ${response.status}: ${errText.slice(0,200)}`);
+    }
+
+    const data = await response.json();
+    _aiResults = data;
+
+    // Render results
+    renderAIResults(data);
+  } catch(e) {
+    console.error('[AI] Analysis failed:', e);
+    body.innerHTML = `
+      <div style="text-align:center;padding:30px">
+        <div style="font-size:36px;margin-bottom:12px">❌</div>
+        <div style="font-weight:700;color:var(--red);margin-bottom:8px">AI Analysis Failed</div>
+        <div style="font-size:12px;color:var(--muted);margin-bottom:16px">${sanitize(e.message)}</div>
+        <div style="font-size:11px;color:var(--dim);max-width:400px;margin:0 auto">
+          Make sure at least one AI API key is set in Vercel env vars:<br>
+          <code>GEMINI_API_KEY</code>, <code>DEEPSEEK_API_KEY</code>, <code>GROQ_API_KEY</code>
+        </div>
+        <button class="ai-run-btn" onclick="runAIAnalysis()" style="margin-top:16px">🔄 Retry</button>
+      </div>`;
+  } finally {
+    if(btn) btn.disabled = false;
+  }
+}
+
+// ── Render AI Results ───────────────────────────────────────────
+function renderAIResults(data) {
+  const body = $id('aiBody');
+  if(!body) return;
+
+  const { analysts, master, errors } = data;
+  let html = '';
+
+  // Master verdict (TOP — most important)
+  if(master) {
+    const vClass = master.verdict === 'TAKE TRADE' ? 'take' : master.verdict === 'SKIP' ? 'skip' : 'wait';
+    const vIcon = master.verdict === 'TAKE TRADE' ? '✅' : master.verdict === 'SKIP' ? '❌' : '⏸️';
+    const consIcon = master.consensus === 'unanimous' ? '🟢' : master.consensus === 'majority' ? '🟡' : '🔴';
+
+    html += `<div class="ai-master-card">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+        <div style="font-size:14px;font-weight:800;background:linear-gradient(90deg,#a855f7,#6366f1);-webkit-background-clip:text;-webkit-text-fill-color:transparent">👑 MASTER AI VERDICT</div>
+        <span class="ai-verdict-badge ${vClass}">${vIcon} ${master.verdict}</span>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:12px">
+        <div style="text-align:center;background:var(--bg3);border-radius:8px;padding:8px">
+          <div style="font-size:22px;font-weight:800;color:${master.confidence>=70?'var(--green)':master.confidence>=50?'var(--yellow)':'var(--red)'}">${master.confidence}%</div>
+          <div style="font-size:9px;color:var(--muted);text-transform:uppercase">Confidence</div>
+        </div>
+        <div style="text-align:center;background:var(--bg3);border-radius:8px;padding:8px">
+          <div style="font-size:12px;font-weight:700;color:var(--text)">${consIcon} ${master.consensus}</div>
+          <div style="font-size:9px;color:var(--muted);text-transform:uppercase">Consensus</div>
+        </div>
+      </div>
+      <div style="font-size:12px;color:var(--text);line-height:1.5;margin-bottom:8px">${sanitize(master.finalReasoning)}</div>
+      <div style="background:rgba(0,0,0,.2);border-radius:8px;padding:10px;margin-bottom:8px">
+        <div style="font-size:10px;font-weight:700;color:var(--cyan);margin-bottom:4px">💡 KEY INSIGHT</div>
+        <div style="font-size:11px;color:var(--dim)">${sanitize(master.keyInsight)}</div>
+      </div>
+      <div style="background:rgba(255,45,85,.06);border-radius:8px;padding:10px;margin-bottom:8px">
+        <div style="font-size:10px;font-weight:700;color:var(--red);margin-bottom:4px">⚠️ RISK WARNING</div>
+        <div style="font-size:11px;color:var(--dim)">${sanitize(master.riskWarning)}</div>
+      </div>
+      <div style="background:rgba(5,229,122,.06);border-radius:8px;padding:10px;margin-bottom:8px">
+        <div style="font-size:10px;font-weight:700;color:var(--green);margin-bottom:4px">🎯 OPTIMAL ENTRY</div>
+        <div style="font-size:11px;color:var(--dim)">${sanitize(master.optimalEntry)}</div>
+      </div>
+      <div style="font-size:10px;color:var(--muted);margin-top:6px">💼 ${sanitize(master.positionAdvice)}</div>
+    </div>`;
+  }
+
+  // Divider
+  html += '<div style="font-size:10px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:1px;margin:16px 0 8px">📊 3 Independent Analyst AIs</div>';
+
+  // Analyst cards
+  if(analysts && analysts.length > 0) {
+    for(const a of analysts) {
+      const vClass = a.verdict === 'TAKE TRADE' ? 'take' : a.verdict === 'SKIP' ? 'skip' : a.verdict === 'WAIT' ? 'wait' : 'error';
+      const vIcon = a.verdict === 'TAKE TRADE' ? '✅' : a.verdict === 'SKIP' ? '❌' : a.verdict === 'WAIT' ? '⏸️' : '⚠️';
+      const providerIcon = a.provider === 'Gemini' ? '🔵' : a.provider === 'DeepSeek' ? '🟣' : a.provider === 'Groq' ? '🟢' : '⚪';
+
+      html += `<div class="ai-analyst-card ${vClass}">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+          <div style="font-size:12px;font-weight:700;color:var(--text)">${providerIcon} ${a.provider} <span style="font-size:9px;color:var(--muted);font-weight:400">(${a.model})</span></div>
+          <span class="ai-verdict-badge ${vClass}">${vIcon} ${a.verdict}</span>
+        </div>
+        <div style="font-size:11px;color:var(--muted);margin-bottom:6px">Confidence: <strong style="color:${a.confidence>=70?'var(--green)':a.confidence>=50?'var(--yellow)':'var(--red)'}">${a.confidence}%</strong></div>`;
+
+      if(a.trapDetected) {
+        html += `<div style="background:rgba(255,45,85,.08);border:1px solid rgba(255,45,85,.2);border-radius:6px;padding:8px;margin-bottom:6px">
+          <div style="font-size:10px;font-weight:700;color:var(--red);margin-bottom:3px">🪤 TRAP DETECTED</div>
+          <div style="font-size:10px;color:var(--dim)">${sanitize(a.trapType || 'Trap type not specified')}</div>
+        </div>`;
+      }
+
+      if(a.retailView && a.retailView !== 'N/A') {
+        html += `<div style="font-size:10px;color:var(--muted);margin-bottom:4px"><strong style="color:var(--dim)">Retail view:</strong> ${sanitize(a.retailView)}</div>`;
+      }
+      html += `<div style="font-size:10px;color:var(--muted);margin-bottom:4px"><strong style="color:var(--dim)">Smart entry:</strong> ${sanitize(a.smartEntry || 'N/A')}</div>`;
+      html += `<div style="font-size:11px;color:var(--text);line-height:1.4;margin-top:6px">${sanitize(a.reasoning)}</div>`;
+      html += `</div>`;
+    }
+  }
+
+  // Errors
+  if(errors && errors.length > 0) {
+    html += '<div style="font-size:10px;color:var(--red);margin-top:8px">⚠️ API errors: ' + errors.map(e => e.provider + ' (' + sanitize(e.error) + ')').join(', ') + '</div>';
+  }
+
+  // Retry button
+  html += '<div style="text-align:center;margin-top:16px"><button class="ai-run-btn" onclick="runAIAnalysis()">🔄 Re-run Analysis</button></div>';
+
+  body.innerHTML = html;
+}
+
+// Close on backdrop click
+$id('aiOverlay')?.addEventListener('click', e => {
+  if(e.target.id === 'aiOverlay') { _aiModalOpen = false; e.target.classList.remove('open'); }
+});
 </script>
 
 <!-- HOT SESSIONS — BUTTON + CENTERED MODAL -->
@@ -11482,6 +11862,27 @@ function _triggerGateRender() {
 <button class="tj-btn" id="tjBtn" onclick="tjToggle()" title="Trade Journal 📒">
   📒<span class="tj-badge" id="tjBadge" style="display:none"></span>
 </button>
+
+<!-- AI SMART MONEY ANALYSIS — FLOATING BUTTON + MODAL -->
+<button class="ai-btn" id="aiBtn" onclick="aiToggle()" title="🧠 AI Smart Money Analysis">
+  🧠
+</button>
+<div class="ai-overlay" id="aiOverlay">
+  <div class="ai-modal">
+    <div class="ai-modal-header">
+      <div class="ai-modal-title">🧠 Smart Money AI Analysis</div>
+      <button class="ai-modal-close" onclick="aiToggle()">✕</button>
+    </div>
+    <div class="ai-modal-body" id="aiBody">
+      <div style="text-align:center;padding:40px 20px;color:var(--muted)">
+        <div style="font-size:36px;margin-bottom:12px">🧠</div>
+        <div style="font-weight:600;color:var(--text);margin-bottom:6px">AI Smart Money Analysis</div>
+        <div style="font-size:12px">Run analysis first, then click below.<br>3 AI agents + 1 Master AI = institutional-grade verdict.</div>
+        <button class="ai-run-btn" id="aiRunBtn" onclick="runAIAnalysis()" style="margin-top:16px">🚀 Start AI Analysis</button>
+      </div>
+    </div>
+  </div>
+</div>
 <div class="tj-overlay" id="tjOverlay">
   <div class="tj-modal">
     <div class="tj-modal-header">
