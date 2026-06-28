@@ -104,7 +104,7 @@ async function callWithRetry(fn, maxRetries = 2, baseDelay = 2000) {
 }
 
 // ── Groq caller ─────────────────────────────────────────────────
-async function callGroq(prompt, apiKey, userContent, model) {
+async function callGroq(prompt, apiKey, userContent, model, temperature = 0.7) {
   const url = 'https://api.groq.com/openai/v1/chat/completions';
   const body = {
     model,
@@ -112,7 +112,7 @@ async function callGroq(prompt, apiKey, userContent, model) {
       { role: 'system', content: prompt },
       { role: 'user', content: userContent },
     ],
-    temperature: 0.7,
+    temperature,
     max_tokens: 1500,
   };
   const res = await fetch(url, {
@@ -161,10 +161,10 @@ async function callOpenRouter(prompt, apiKey, userContent, model) {
 }
 
 // ── Smart caller: tries Groq first, then OpenRouter fallback ────
-async function smartCall(prompt, snapshotStr, groqKey, orKey, groqModel, orFallbackModels) {
+async function smartCall(prompt, snapshotStr, groqKey, orKey, groqModel, orFallbackModels, temperature = 0.7) {
   // Try Groq first (dedicated rate limit, not shared)
   try {
-    const text = await callWithRetry(() => callGroq(prompt, groqKey, snapshotStr, groqModel));
+    const text = await callWithRetry(() => callGroq(prompt, groqKey, snapshotStr, groqModel, temperature));
     return { text, modelUsed: groqModel, provider: 'Groq' };
   } catch(groqErr) {
     console.warn(`[AI] Groq ${groqModel} failed: ${groqErr.message.slice(0, 100)}`);
@@ -225,21 +225,26 @@ export default async function handler(req, res) {
 
   // ── Analyst configs: Groq primary, OpenRouter fallback ────────
   // Each analyst uses a DIFFERENT Groq model for genuine independence.
-  // Groq has per-user rate limits (not shared like OpenRouter free tier).
+  // NOTE: deepseek-r1-distill-llama-70b was DECOMMISSIONED by Groq.
+  // Replaced with gemma2-9b-it (different architecture = genuine independence).
+  // If a Groq model is decommissioned, smartCall falls back to OpenRouter.
   const analysts_config = [
     {
       name: 'Llama-3.3-70B',
       groqModel: 'llama-3.3-70b-versatile',
+      groqTemp: 0.7,
       orFallback: ['meta-llama/llama-3.3-70b-instruct:free', 'nvidia/nemotron-3-super-120b-a12b:free'],
     },
     {
-      name: 'DeepSeek-R1-70B',
-      groqModel: 'deepseek-r1-distill-llama-70b',
+      name: 'Gemma2-9B',
+      groqModel: 'gemma2-9b-it',
+      groqTemp: 0.8,
       orFallback: ['openai/gpt-oss-120b:free', 'google/gemma-4-31b-it:free'],
     },
     {
       name: 'Llama-3.1-8B',
       groqModel: 'llama-3.1-8b-instant',
+      groqTemp: 0.9,
       orFallback: ['meta-llama/llama-3.2-3b-instruct:free', 'qwen/qwen3-coder:free'],
     },
   ];
@@ -251,7 +256,7 @@ export default async function handler(req, res) {
     try {
       const result = await smartCall(
         ANALYST_PROMPT, snapshotStr, groqKey, orKey,
-        provider.groqModel, provider.orFallback
+        provider.groqModel, provider.orFallback, provider.groqTemp || 0.7
       );
       const parsed = extractJSON(result.text);
       return {
