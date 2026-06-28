@@ -9381,17 +9381,23 @@ function _tjImportData(jsonStr) {
     for (const imp of importedTrades) {
       if (!imp || !imp.id) { skipped++; continue; }
       if (existingIds.has(imp.id)) {
-        // Merge: keep the version with the most recent closedAt (or pending)
+        // Merge: keep the version with the most recent state
         const idx = allTrades.findIndex(t => t.id === imp.id);
         if (idx >= 0) {
           const local = allTrades[idx];
-          // If imported trade is closed and local is pending → use imported
-          // If both closed → use the one with later closedAt
-          // If local closed and imported pending → keep local (more advanced state)
+          // ── BUG FIX: pending+pending case was missing ──────────
+          // Previously: if both pending, it fell through to the else
+          // branch which just skipped (losing the imported trade's
+          // potentially newer tp1HitAt/pnlUsd data).
+          // Now: for pending+pending, keep the one with the newer
+          // timestamp or tp1HitAt (trade may have been updated on
+          // the other device — TP1 hit, P&L filled, etc.)
           if (imp.status !== 'pending' && local.status === 'pending') {
+            // Cloud closed, local pending → use cloud (more advanced)
             allTrades[idx] = imp;
             merged++;
           } else if (imp.status !== 'pending' && local.status !== 'pending') {
+            // Both closed → keep newer closedAt
             const impClose = imp.closedAt ? new Date(imp.closedAt).getTime() : 0;
             const locClose = local.closedAt ? new Date(local.closedAt).getTime() : 0;
             if (impClose > locClose) {
@@ -9400,8 +9406,20 @@ function _tjImportData(jsonStr) {
             } else {
               skipped++;
             }
+          } else if (imp.status === 'pending' && local.status === 'pending') {
+            // Both pending → keep the one with newer tp1HitAt or timestamp
+            // (the other device may have recorded TP1 hit, pnlUsd, etc.)
+            const impTime = imp.tp1HitAt ? new Date(imp.tp1HitAt).getTime() : new Date(imp.timestamp).getTime();
+            const locTime = local.tp1HitAt ? new Date(local.tp1HitAt).getTime() : new Date(local.timestamp).getTime();
+            if (impTime > locTime) {
+              allTrades[idx] = imp;
+              merged++;
+            } else {
+              skipped++;
+            }
           } else {
-            skipped++; // local is closed, imported is pending → keep local
+            // Local closed, imported pending → keep local (more advanced)
+            skipped++;
           }
         }
       } else {
@@ -9491,7 +9509,7 @@ function tjUploadBackup() {
 async function tjCloudSync() {
   const syncCfg = _tjLoadSync();
   if (!syncCfg.githubToken) {
-    return { success: false, message: 'No GitHub token configured', synced: 0 };
+    return { success: false, message: 'No GitHub token configured. Enter a token in the Sync tab.', synced: 0 };
   }
 
   const data = _tjExportData();
@@ -9532,7 +9550,13 @@ async function tjCloudSync() {
 
     if (!response.ok) {
       const errBody = await response.json().catch(()=>({}));
-      throw new Error(`GitHub API ${response.status}: ${errBody.message || response.statusText}`);
+      // ── BUG FIX: User-friendly error messages for common failures ──
+      let errMsg = errBody.message || response.statusText;
+      if (response.status === 401) errMsg = 'Invalid or expired GitHub token. Generate a new one with "gist" scope.';
+      else if (response.status === 403) errMsg = 'Token lacks "gist" scope. Regenerate with gist permission.';
+      else if (response.status === 404 && syncCfg.gistId) errMsg = 'Gist not found (may have been deleted). Clear gist ID and try again.';
+      else if (response.status === 429) errMsg = 'GitHub API rate limited. Wait a minute and try again.';
+      throw new Error(`GitHub API ${response.status}: ${errMsg}`);
     }
 
     const gist = await response.json();
@@ -9545,7 +9569,7 @@ async function tjCloudSync() {
     }
 
     const trades = _tjLoad();
-    return { success: true, message: 'Synced successfully', synced: trades.length };
+    return { success: true, message: 'Pushed to cloud', synced: trades.length };
   } catch(e) {
     console.error('[Sync] Cloud sync failed:', e);
     _tjSaveSync({ ...syncCfg, lastSyncAt: Date.now(), lastSyncStatus: 'error' });
@@ -9604,13 +9628,25 @@ function tjScheduleSyncPush() {
 }
 
 // On page load: pull from cloud (if configured), then schedule push
+// ── BUG FIX: Auto-pull was overwriting local pending trades with stale
+// cloud data. Now auto-pull only runs if local has fewer trades than
+// cloud (indicating this device hasn't synced yet). If both have trades,
+// user must manually pull to avoid losing local changes.
 setTimeout(async () => {
   const syncCfg = _tjLoadSync();
   if (syncCfg.githubToken && syncCfg.gistId) {
-    console.log('[Sync] Auto-pull on page load...');
-    const result = await tjCloudPull().catch(()=>({success:false}));
-    if (result.success) console.log('[Sync] Auto-pull complete:', result.pulled, 'trades merged');
-    if (_tjOpen) _tjRenderBody();
+    const localTrades = _tjLoad();
+    // Only auto-pull if local is empty (first sync on this device)
+    // or last sync was >1 hour ago (stale data)
+    const syncAge = syncCfg.lastSyncAt ? Date.now() - syncCfg.lastSyncAt : Infinity;
+    if (localTrades.length === 0 || syncAge > 3600000) {
+      console.log('[Sync] Auto-pull on page load (local empty or stale)...');
+      const result = await tjCloudPull().catch(()=>({success:false}));
+      if (result.success) console.log('[Sync] Auto-pull complete:', result.pulled, 'trades merged');
+      if (_tjOpen) _tjRenderBody();
+    } else {
+      console.log('[Sync] Skipping auto-pull (local has data, last sync recent)');
+    }
   }
 }, 3000); // 3s delay to let page settle
 
@@ -9700,10 +9736,33 @@ function tjShowSyncResult(result) {
   if (result.success) {
     console.log('[Sync] ' + result.message + ' (' + (result.synced || result.pulled) + ' trades)');
     if (_tjOpen) _tjRenderBody();
+    // Show non-blocking toast instead of alert
+    tjShowToast('✓ ' + result.message + ' (' + (result.synced || result.pulled) + ' trades)', 'success');
   } else {
     console.warn('[Sync] ' + result.message);
-    alert('Sync failed: ' + result.message);
+    tjShowToast('✗ Sync failed: ' + result.message, 'error');
   }
+}
+
+// Non-blocking toast notification (replaces alert)
+function tjShowToast(message, type) {
+  let toast = $id('tjToast');
+  if (!toast) {
+    toast = document.createElement('div');
+    toast.id = 'tjToast';
+    toast.style.cssText = 'position:fixed;bottom:20px;left:50%;transform:translateX(-50%);z-index:10001;padding:12px 24px;border-radius:10px;font-size:13px;font-weight:600;font-family:Sora,sans-serif;transition:opacity .3s,transform .3s;opacity:0;pointer-events:none;max-width:90vw;text-align:center;';
+    document.body.appendChild(toast);
+  }
+  toast.textContent = message;
+  toast.style.background = type === 'success' ? 'rgba(5,229,122,.15)' : 'rgba(255,45,85,.15)';
+  toast.style.border = '1px solid ' + (type === 'success' ? 'rgba(5,229,122,.4)' : 'rgba(255,45,85,.4)');
+  toast.style.color = type === 'success' ? 'var(--green)' : 'var(--red)';
+  toast.style.opacity = '1';
+  toast.style.transform = 'translateX(-50%) translateY(0)';
+  setTimeout(() => {
+    toast.style.opacity = '0';
+    toast.style.transform = 'translateX(-50%) translateY(10px)';
+  }, 4000);
 }
 
 // ── Kelly Criterion Calculation ──────────────────────────────────
