@@ -18,6 +18,10 @@
       "use": "@vercel/node"
     },
     {
+      "src": "api/gist.js",
+      "use": "@vercel/node"
+    },
+    {
       "src": "index.html",
       "use": "@vercel/static"
     }
@@ -38,6 +42,10 @@
     {
       "src": "/api/ai-analysis",
       "dest": "/api/ai-analysis.js"
+    },
+    {
+      "src": "/api/gist",
+      "dest": "/api/gist.js"
     },
     {
       "src": "/(.*)",
