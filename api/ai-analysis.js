@@ -6,7 +6,9 @@
  *     - Analyst 1: Groq → llama-3.3-70b-versatile (fast, 70B params)
  *     - Analyst 2: DeepSeek → deepseek-chat (V3, 671B MoE, deep reasoning)
  *     - Analyst 3: OpenRouter → qwen3-next-80b-a3b-instruct (80B, FREE!)
- *   1 Master agent: Gemini → gemini-2.0-flash (upgraded from 1.5)
+ *   1 Master agent: OpenRouter → Hermes-3-Llama-405B (405B params! FREE!)
+ *     — Most powerful FREE model available (405B > Gemini Flash ~27B)
+ *     — 131K context, excellent at reasoning and synthesis
  *
  * FALLBACK: If OpenRouter key is set but Groq/DeepSeek aren't,
  *   OpenRouter is used for ALL 3 analysts with different models:
@@ -19,7 +21,6 @@
  *   GROQ_API_KEY       — https://console.groq.com/keys
  *   DEEPSEEK_API_KEY   — https://platform.deepseek.com/api_keys
  *   OPENROUTER_API_KEY — https://openrouter.ai/keys (gives free credits)
- *   GEMINI_API_KEY     — https://aistudio.google.com/apikey
  *
  * Usage: POST /api/ai-analysis
  *   Body: { snapshot: {...} }
@@ -259,19 +260,19 @@ export default async function handler(req, res) {
     });
   }
 
-  // Analyst 4 (bonus): Gemini if available and we need more
-  if (analysts_config.length < 3 && process.env.GEMINI_API_KEY) {
+  // Analyst 4 (bonus): NVIDIA Nemotron 120B if we need more analysts
+  if (analysts_config.length < 3 && process.env.OPENROUTER_API_KEY) {
     analysts_config.push({
-      name: 'Gemini',
-      model: 'gemini-2.0-flash',
-      key: process.env.GEMINI_API_KEY,
-      call: callGemini,
+      name: 'OpenRouter-Nemotron',
+      model: 'nvidia/nemotron-3-super-120b-a12b:free', // 120B, 1M context, FREE
+      key: process.env.OPENROUTER_API_KEY,
+      call: callOpenRouter,
     });
   }
 
   if (analysts_config.length === 0) {
     return res.status(503).json({
-      error: 'No AI API keys configured. Set at least one: GROQ_API_KEY, DEEPSEEK_API_KEY, OPENROUTER_API_KEY, or GEMINI_API_KEY in Vercel env vars.',
+      error: 'No AI API keys configured. Set at least OPENROUTER_API_KEY (recommended, free) in Vercel env vars.',
       hint: 'OpenRouter is recommended — 1 key gives access to Qwen3, Llama, GPT-OSS and more for FREE.',
       analysts: [],
       master: null,
@@ -315,8 +316,11 @@ export default async function handler(req, res) {
   // ── Phase 2: Master AI synthesizes ────────────────────────────
   let master = null;
 
-  // Try Gemini 2.0 Flash for Master (upgraded from 1.5)
-  if (validAnalysts.length >= 2 && process.env.GEMINI_API_KEY) {
+  // ── Master AI: Hermes-3-Llama-405B (405B params, FREE on OpenRouter) ──
+  // Most powerful free model available — far exceeds Gemini Flash in reasoning.
+  // 131K context is plenty for 3 analyst outputs.
+  // Fallback chain: Hermes-405B → GPT-OSS-120B → Qwen3-Coder → fallback consensus
+  if (validAnalysts.length >= 2 && process.env.OPENROUTER_API_KEY) {
     try {
       const masterInput = JSON.stringify(validAnalysts.map(a => ({
         provider: a.provider,
@@ -328,7 +332,19 @@ export default async function handler(req, res) {
         reasoning: a.reasoning,
       })), null, 2);
 
-      const masterRaw = await callGemini(MASTER_PROMPT, process.env.GEMINI_API_KEY, masterInput, 'gemini-2.0-flash');
+      // Try Hermes-3 405B first (most powerful free model)
+      let masterRaw;
+      try {
+        masterRaw = await callOpenRouter(MASTER_PROMPT, process.env.OPENROUTER_API_KEY, masterInput, 'nousresearch/hermes-3-llama-3.1-405b:free');
+      } catch(e1) {
+        // Fallback: GPT-OSS 120B (second most powerful free)
+        try {
+          masterRaw = await callOpenRouter(MASTER_PROMPT, process.env.OPENROUTER_API_KEY, masterInput, 'openai/gpt-oss-120b:free');
+        } catch(e2) {
+          // Fallback: Qwen3-Coder (1M context)
+          masterRaw = await callOpenRouter(MASTER_PROMPT, process.env.OPENROUTER_API_KEY, masterInput, 'qwen/qwen3-coder:free');
+        }
+      }
       const parsed = extractJSON(masterRaw);
       master = {
         verdict: parsed?.verdict || 'WAIT',
@@ -339,43 +355,10 @@ export default async function handler(req, res) {
         riskWarning: parsed?.riskWarning || 'N/A',
         optimalEntry: parsed?.optimalEntry || 'N/A',
         positionAdvice: parsed?.positionAdvice || 'N/A',
-        masterModel: 'gemini-2.0-flash',
+        masterModel: 'Hermes-3-Llama-405B (OpenRouter)',
       };
     } catch(e) {
-      errors.push({ provider: 'Master (Gemini 2.0)', error: e.message });
-      master = computeFallbackMaster(validAnalysts);
-    }
-  } else if (validAnalysts.length >= 2) {
-    // No Gemini key — use fallback consensus or try OpenRouter for master
-    if (process.env.OPENROUTER_API_KEY) {
-      try {
-        const masterInput = JSON.stringify(validAnalysts.map(a => ({
-          provider: a.provider,
-          verdict: a.verdict,
-          confidence: a.confidence,
-          trapDetected: a.trapDetected,
-          trapType: a.trapType,
-          reasoning: a.reasoning,
-        })), null, 2);
-
-        const masterRaw = await callOpenRouter(MASTER_PROMPT, process.env.OPENROUTER_API_KEY, masterInput, 'qwen/qwen3-coder:free');
-        const parsed = extractJSON(masterRaw);
-        master = {
-          verdict: parsed?.verdict || 'WAIT',
-          confidence: parsed?.confidence || 0,
-          consensus: parsed?.consensus || 'unknown',
-          finalReasoning: parsed?.finalReasoning || 'Master analysis unavailable',
-          keyInsight: parsed?.keyInsight || 'N/A',
-          riskWarning: parsed?.riskWarning || 'N/A',
-          optimalEntry: parsed?.optimalEntry || 'N/A',
-          positionAdvice: parsed?.positionAdvice || 'N/A',
-          masterModel: 'qwen3-coder (OpenRouter)',
-        };
-      } catch(e2) {
-        errors.push({ provider: 'Master (OpenRouter)', error: e2.message });
-        master = computeFallbackMaster(validAnalysts);
-      }
-    } else {
+      errors.push({ provider: 'Master (OpenRouter)', error: e.message });
       master = computeFallbackMaster(validAnalysts);
     }
   } else if (validAnalysts.length === 1) {
