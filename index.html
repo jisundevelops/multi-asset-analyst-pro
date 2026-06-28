@@ -9710,6 +9710,20 @@ function tjRenderSyncCard() {
   html += '</div>';
   html += '</div>';
 
+  // ── Gist URL import (NEW — import from any public gist URL) ──
+  html += '<div style="background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:12px;margin-bottom:10px">';
+  html += '<div style="font-size:10px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:1px;margin-bottom:8px">🔗 Import from Gist URL</div>';
+  html += '<div style="font-size:10px;color:var(--muted);margin-bottom:8px;line-height:1.4">';
+  html += 'আগের backup থাকা Gist URL দিন। Trade গুলো merge হয়ে যাবে।<br>';
+  html += 'Token লাগবে না — public gist থেকেও import হবে।';
+  html += '</div>';
+  html += '<div style="margin-bottom:8px">';
+  html += '<input type="text" id="gistUrlInput" placeholder="https://gist.github.com/user/gist_id বা শুধু gist_id" ';
+  html += 'style="width:100%;background:var(--bg3);border:1px solid var(--border);border-radius:6px;padding:8px 10px;font-size:11px;color:var(--text)" />';
+  html += '</div>';
+  html += '<button onclick="tjImportFromGistUrl()" style="width:100%;background:rgba(168,85,247,.12);border:1px solid rgba(168,85,247,.3);color:#c084fc;padding:8px 12px;border-radius:6px;font-size:11px;font-weight:600;cursor:pointer;font-family:Sora,sans-serif">🔗 Import from Gist</button>';
+  html += '</div>';
+
   // Manual backup buttons
   html += '<div style="background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:12px">';
   html += '<div style="font-size:10px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:1px;margin-bottom:8px">Manual Backup (no setup needed)</div>';
@@ -9730,6 +9744,85 @@ function tjSaveSyncField(field, value) {
   const cfg = _tjLoadSync();
   cfg[field] = value;
   _tjSaveSync(cfg);
+}
+
+// ── Import from Gist URL (NEW) ──────────────────────────────────
+// Fetches trades from any public gist — no GitHub token needed.
+// Accepts: full URL, gist ID, or embed script URL
+async function tjImportFromGistUrl() {
+  const input = $id('gistUrlInput');
+  if (!input || !input.value.trim()) {
+    tjShowToast('⚠️ Gist URL দিন', 'error');
+    return;
+  }
+
+  let gistId = input.value.trim();
+
+  // Extract gist ID from various URL formats
+  // https://gist.github.com/user/9b35c35b353492773f464338bd07c566 → 9b35c35b353492773f464338bd07c566
+  // https://gist.github.com/user/9b35c35b353492773f464338bd07c566.js → 9b35c35b353492773f464338bd07c566
+  // 9b35c35b353492773f464338bd07c566 → 9b35c35b353492773f464338bd07c566
+  const urlMatch = gistId.match(/([a-f0-9]{20,})/i);
+  if (urlMatch) {
+    gistId = urlMatch[1];
+  } else {
+    tjShowToast('✗ Invalid Gist URL/ID', 'error');
+    return;
+  }
+
+  // Show loading
+  const btn = event?.target;
+  if (btn) { btn.disabled = true; btn.textContent = '⏳ Importing...'; }
+
+  try {
+    // Fetch gist via GitHub API (public gists don't need auth)
+    const response = await fetch(`https://api.github.com/gists/${gistId}`, {
+      headers: { 'Accept': 'application/vnd.github.v3+json' },
+    });
+
+    if (!response.ok) {
+      throw new Error(`GitHub API ${response.status}: ${response.statusText}`);
+    }
+
+    const gist = await response.json();
+    const filename = 'trade-journal.json';
+    const file = gist.files && gist.files[filename];
+
+    if (!file || !file.content) {
+      // Try any JSON file in the gist
+      const jsonFiles = Object.values(gist.files || {}).filter(f =>
+        f.content && f.content.trim().startsWith('{')
+      );
+      if (jsonFiles.length > 0) {
+        const result = _tjImportData(jsonFiles[0].content);
+        tjShowImportResult(result);
+      } else {
+        throw new Error('No trade-journal.json found in gist');
+      }
+    } else {
+      const result = _tjImportData(file.content);
+      tjShowImportResult(result);
+    }
+
+    // Also save this gistId for future sync
+    const syncCfg = _tjLoadSync();
+    _tjSaveSync({ ...syncCfg, gistId: gistId });
+
+  } catch(e) {
+    console.error('[Sync] Gist import failed:', e);
+    tjShowToast('✗ Import failed: ' + e.message, 'error');
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '🔗 Import from Gist'; }
+  }
+}
+
+function tjShowImportResult(result) {
+  if (result.error) {
+    tjShowToast('✗ Import failed: ' + result.error, 'error');
+  } else {
+    tjShowToast(`✓ Imported! ${result.merged} merged, ${result.skipped} duplicates skipped`, 'success');
+    if (_tjOpen) _tjRenderBody();
+  }
 }
 
 function tjShowSyncResult(result) {
