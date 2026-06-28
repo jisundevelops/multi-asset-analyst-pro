@@ -161,30 +161,62 @@ async function callOpenRouter(prompt, apiKey, userContent, model) {
 }
 
 // ── Smart caller: tries Groq first, then OpenRouter fallback ────
-async function smartCall(prompt, snapshotStr, groqKey, orKey, groqModel, orFallbackModels, temperature = 0.7) {
-  // Try Groq first (dedicated rate limit, not shared)
-  try {
-    const text = await callWithRetry(() => callGroq(prompt, groqKey, snapshotStr, groqModel, temperature));
-    return { text, modelUsed: groqModel, provider: 'Groq' };
-  } catch(groqErr) {
-    console.warn(`[AI] Groq ${groqModel} failed: ${groqErr.message.slice(0, 100)}`);
-
-    // Fallback to OpenRouter if available
-    if (orKey && orFallbackModels && orFallbackModels.length > 0) {
-      for (const orModel of orFallbackModels) {
-        try {
-          console.log(`[AI] Trying OpenRouter fallback: ${orModel}`);
-          const text = await callWithRetry(() => callOpenRouter(prompt, orKey, snapshotStr, orModel), 1, 3000);
-          return { text, modelUsed: orModel, provider: 'OpenRouter' };
-        } catch(orErr) {
-          console.warn(`[AI] OpenRouter ${orModel} failed: ${orErr.message.slice(0, 100)}`);
-        }
+// If orPrimary=true, tries OpenRouter FIRST (for provider diversity)
+async function smartCall(prompt, snapshotStr, groqKey, orKey, groqModel, orFallbackModels, temperature = 0.7, orPrimary = false) {
+  // If orPrimary, try OpenRouter first
+  if (orPrimary && orKey && orFallbackModels && orFallbackModels.length > 0) {
+    for (const orModel of orFallbackModels) {
+      try {
+        console.log(`[AI] Trying OpenRouter (primary): ${orModel}`);
+        const text = await callWithRetry(() => callOpenRouter(prompt, orKey, snapshotStr, orModel), 1, 3000);
+        return { text, modelUsed: orModel, provider: 'OpenRouter' };
+      } catch(orErr) {
+        console.warn(`[AI] OpenRouter ${orModel} failed: ${orErr.message.slice(0, 100)}`);
       }
     }
-
-    // All failed — throw last Groq error
-    throw groqErr;
+    // OpenRouter failed — fall through to Groq
   }
+
+  // Try Groq (dedicated rate limit, not shared)
+  if (groqKey) {
+    try {
+      const text = await callWithRetry(() => callGroq(prompt, groqKey, snapshotStr, groqModel, temperature));
+      return { text, modelUsed: groqModel, provider: 'Groq' };
+    } catch(groqErr) {
+      console.warn(`[AI] Groq ${groqModel} failed: ${groqErr.message.slice(0, 100)}`);
+
+      // Fallback to OpenRouter if available
+      if (orKey && orFallbackModels && orFallbackModels.length > 0) {
+        for (const orModel of orFallbackModels) {
+          try {
+            console.log(`[AI] Trying OpenRouter fallback: ${orModel}`);
+            const text = await callWithRetry(() => callOpenRouter(prompt, orKey, snapshotStr, orModel), 1, 3000);
+            return { text, modelUsed: orModel, provider: 'OpenRouter' };
+          } catch(orErr) {
+            console.warn(`[AI] OpenRouter ${orModel} failed: ${orErr.message.slice(0, 100)}`);
+          }
+        }
+      }
+
+      // All failed — throw last Groq error
+      throw groqErr;
+    }
+  }
+
+  // No Groq key — try OpenRouter only
+  if (orKey && orFallbackModels && orFallbackModels.length > 0) {
+    for (const orModel of orFallbackModels) {
+      try {
+        console.log(`[AI] Trying OpenRouter (no Groq): ${orModel}`);
+        const text = await callWithRetry(() => callOpenRouter(prompt, orKey, snapshotStr, orModel), 1, 3000);
+        return { text, modelUsed: orModel, provider: 'OpenRouter' };
+      } catch(orErr) {
+        console.warn(`[AI] OpenRouter ${orModel} failed: ${orErr.message.slice(0, 100)}`);
+      }
+    }
+  }
+
+  throw new Error('All AI providers failed');
 }
 
 // ── JSON extractor ──────────────────────────────────────────────
@@ -224,10 +256,18 @@ export default async function handler(req, res) {
   }
 
   // ── Analyst configs: Groq primary, OpenRouter fallback ────────
-  // Each analyst uses a DIFFERENT Groq model for genuine independence.
-  // NOTE: deepseek-r1-distill-llama-70b was DECOMMISSIONED by Groq.
-  // Replaced with gemma2-9b-it (different architecture = genuine independence).
-  // If a Groq model is decommissioned, smartCall falls back to OpenRouter.
+  // Groq decommissions models frequently. Only use CONFIRMED ACTIVE models.
+  // As of latest check, ONLY these 2 Groq models are production-stable:
+  //   - llama-3.3-70b-versatile (70B)
+  //   - llama-3.1-8b-instant (8B)
+  // 
+  // DECOMMISSIONED (do NOT use): gemma2-9b-it, deepseek-r1-distill-llama-70b,
+  //   mixtral-8x7b-32768, llama3-70b-8192, llama3-8b-8192
+  //
+  // Strategy: Use the 2 stable Groq models for Analysts 1+3,
+  // and use OpenRouter (GPT-OSS-120B) as primary for Analyst 2
+  // (different provider = genuine independence, no Groq decommission risk).
+  // If OpenRouter fails, fall back to Groq Llama-70B with different temp.
   const analysts_config = [
     {
       name: 'Llama-3.3-70B',
@@ -236,10 +276,11 @@ export default async function handler(req, res) {
       orFallback: ['meta-llama/llama-3.3-70b-instruct:free', 'nvidia/nemotron-3-super-120b-a12b:free'],
     },
     {
-      name: 'Gemma2-9B',
-      groqModel: 'gemma2-9b-it',
-      groqTemp: 0.8,
-      orFallback: ['openai/gpt-oss-120b:free', 'google/gemma-4-31b-it:free'],
+      name: 'GPT-OSS-120B',
+      groqModel: 'llama-3.3-70b-versatile', // Groq fallback (same model, different temp for variety)
+      groqTemp: 0.85,
+      orFallback: ['openai/gpt-oss-120b:free', 'nvidia/nemotron-3-super-120b-a12b:free', 'google/gemma-4-31b-it:free'],
+      orPrimary: true, // Try OpenRouter FIRST for this analyst
     },
     {
       name: 'Llama-3.1-8B',
@@ -256,7 +297,7 @@ export default async function handler(req, res) {
     try {
       const result = await smartCall(
         ANALYST_PROMPT, snapshotStr, groqKey, orKey,
-        provider.groqModel, provider.orFallback, provider.groqTemp || 0.7
+        provider.groqModel, provider.orFallback, provider.groqTemp || 0.7, provider.orPrimary || false
       );
       const parsed = extractJSON(result.text);
       return {
