@@ -1,23 +1,26 @@
 /**
- * Multi-Agent Smart Money AI Analysis Proxy — RESILIENT VERSION
+ * Multi-Agent Smart Money AI Analysis Proxy — GROQ-CENTRIC VERSION
+ *
+ * PROBLEM: OpenRouter free models are in a SHARED pool — all free users
+ * share the same rate limit, causing constant 429 errors.
+ *
+ * SOLUTION: Use Groq as PRIMARY for ALL analysts + Master.
+ * Groq gives each user their OWN rate limit (30 req/min on free tier).
+ * Different Groq models for each analyst = genuine independence.
+ * OpenRouter is fallback only (if Groq is down).
  *
  * Architecture: 4 AI calls per analysis run
- *   3 independent analyst AIs:
- *     - Analyst 1: Groq → llama-3.3-70b-versatile (70B, fast, high rate limit)
- *     - Analyst 2: OpenRouter → openai/gpt-oss-120b:free (120B, FREE)
- *     - Analyst 3: OpenRouter → qwen/qwen3-next-80b-a3b-instruct:free (80B, FREE)
- *   1 Master: OpenRouter → hermes-3-llama-3.1-405b:free (405B, FREE)
+ *   3 independent analyst AIs (different Groq models):
+ *     - Analyst 1: Groq → llama-3.3-70b-versatile (70B, best reasoning)
+ *     - Analyst 2: Groq → deepseek-r1-distill-llama-70b (70B, deep thinking)
+ *     - Analyst 3: Groq → llama-3.1-8b-instant (8B, fast second opinion)
+ *   1 Master: Groq → llama-3.3-70b-versatile (70B, synthesis)
  *
- * RESILIENCE FEATURES:
- *   - Automatic retry with exponential backoff (3 attempts per model)
- *   - Fallback model chain: if primary model rate-limited, try next
- *   - DeepSeek removed (requires paid balance — 402 error)
- *   - Groq is primary (highest free rate limits — 30 req/min)
- *   - OpenRouter models have fallback chain for 429 errors
+ *   OpenRouter fallback: If Groq fails entirely, try OpenRouter models.
  *
  * Vercel env vars:
- *   GROQ_API_KEY       — https://console.groq.com/keys (REQUIRED for Analyst 1)
- *   OPENROUTER_API_KEY — https://openrouter.ai/keys (REQUIRED for Analysts 2,3 + Master)
+ *   GROQ_API_KEY       — https://console.groq.com/keys (REQUIRED, free, 30 req/min)
+ *   OPENROUTER_API_KEY — https://openrouter.ai/keys (OPTIONAL, fallback only)
  *
  * Usage: POST /api/ai-analysis
  *   Body: { snapshot: {...} }
@@ -79,7 +82,7 @@ Respond ONLY in this exact JSON format (no markdown, no extra text):
   "positionAdvice": "position sizing advice based on confidence level"
 }`;
 
-// ── Retry wrapper with exponential backoff ──────────────────────
+// ── Retry wrapper ───────────────────────────────────────────────
 async function callWithRetry(fn, maxRetries = 2, baseDelay = 2000) {
   let lastError;
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
@@ -87,7 +90,6 @@ async function callWithRetry(fn, maxRetries = 2, baseDelay = 2000) {
       return await fn();
     } catch(e) {
       lastError = e;
-      // Don't retry on 4xx errors (except 429)
       const is429 = e.message.includes('429');
       const is5xx = e.message.match(/\b5\d\d\b/);
       if (!is429 && !is5xx) throw e;
@@ -101,26 +103,8 @@ async function callWithRetry(fn, maxRetries = 2, baseDelay = 2000) {
   throw lastError;
 }
 
-// ── OpenRouter caller with model fallback chain ─────────────────
-async function callOpenRouterWithFallback(prompt, apiKey, userContent, modelChain) {
-  let lastError;
-  for (const model of modelChain) {
-    try {
-      console.log(`[AI] Trying OpenRouter model: ${model}`);
-      const result = await callWithRetry(() => callOpenRouter(prompt, apiKey, userContent, model));
-      return { text: result, modelUsed: model };
-    } catch(e) {
-      console.warn(`[AI] Model ${model} failed: ${e.message.slice(0, 100)}`);
-      lastError = e;
-      // Try next model in chain
-    }
-  }
-  throw lastError;
-}
-
-// ── AI Provider Callers ─────────────────────────────────────────
-
-async function callGroq(prompt, apiKey, userContent, model = 'llama-3.3-70b-versatile') {
+// ── Groq caller ─────────────────────────────────────────────────
+async function callGroq(prompt, apiKey, userContent, model) {
   const url = 'https://api.groq.com/openai/v1/chat/completions';
   const body = {
     model,
@@ -145,6 +129,7 @@ async function callGroq(prompt, apiKey, userContent, model = 'llama-3.3-70b-vers
   return data?.choices?.[0]?.message?.content || '';
 }
 
+// ── OpenRouter caller (fallback only) ───────────────────────────
 async function callOpenRouter(prompt, apiKey, userContent, model) {
   const url = 'https://openrouter.ai/api/v1/chat/completions';
   const body = {
@@ -175,6 +160,33 @@ async function callOpenRouter(prompt, apiKey, userContent, model) {
   return data?.choices?.[0]?.message?.content || '';
 }
 
+// ── Smart caller: tries Groq first, then OpenRouter fallback ────
+async function smartCall(prompt, snapshotStr, groqKey, orKey, groqModel, orFallbackModels) {
+  // Try Groq first (dedicated rate limit, not shared)
+  try {
+    const text = await callWithRetry(() => callGroq(prompt, groqKey, snapshotStr, groqModel));
+    return { text, modelUsed: groqModel, provider: 'Groq' };
+  } catch(groqErr) {
+    console.warn(`[AI] Groq ${groqModel} failed: ${groqErr.message.slice(0, 100)}`);
+
+    // Fallback to OpenRouter if available
+    if (orKey && orFallbackModels && orFallbackModels.length > 0) {
+      for (const orModel of orFallbackModels) {
+        try {
+          console.log(`[AI] Trying OpenRouter fallback: ${orModel}`);
+          const text = await callWithRetry(() => callOpenRouter(prompt, orKey, snapshotStr, orModel), 1, 3000);
+          return { text, modelUsed: orModel, provider: 'OpenRouter' };
+        } catch(orErr) {
+          console.warn(`[AI] OpenRouter ${orModel} failed: ${orErr.message.slice(0, 100)}`);
+        }
+      }
+    }
+
+    // All failed — throw last Groq error
+    throw groqErr;
+  }
+}
+
 // ── JSON extractor ──────────────────────────────────────────────
 function extractJSON(text) {
   if (!text) return null;
@@ -199,82 +211,52 @@ export default async function handler(req, res) {
   if (!snapshot) return res.status(400).json({ error: 'Missing snapshot data' });
 
   const snapshotStr = JSON.stringify(snapshot, null, 0);
-  const hasGroq = !!process.env.GROQ_API_KEY;
-  const hasOR = !!process.env.OPENROUTER_API_KEY;
+  const groqKey = process.env.GROQ_API_KEY;
+  const orKey = process.env.OPENROUTER_API_KEY;
 
-  if (!hasGroq && !hasOR) {
+  if (!groqKey && !orKey) {
     return res.status(503).json({
-      error: 'No AI API keys configured. Set at least OPENROUTER_API_KEY (free) in Vercel env vars.',
-      hint: 'Get free key at https://openrouter.ai/keys',
+      error: 'No AI API keys configured. Set GROQ_API_KEY (recommended, free) in Vercel env vars.',
+      hint: 'Get free key at https://console.groq.com/keys — Groq gives 30 req/min per user (not shared).',
       analysts: [],
       master: null,
     });
   }
 
-  // ── Build analyst configs with fallback chains ────────────────
-  // Each analyst has a PRIMARY model + FALLBACK chain for resilience.
-  // If primary is rate-limited (429), the system automatically tries
-  // the next model in the chain.
-  const analysts_config = [];
-
-  // Analyst 1: Groq (primary) → OpenRouter Llama (fallback)
-  // Groq has the highest free rate limits (30 req/min)
-  if (hasGroq) {
-    analysts_config.push({
-      name: 'Groq-Llama',
-      primaryModel: 'llama-3.3-70b-versatile',
-      fallbackModels: hasOR ? ['meta-llama/llama-3.3-70b-instruct:free'] : [],
-      call: async (prompt, content) => {
-        try {
-          return { text: await callWithRetry(() => callGroq(prompt, process.env.GROQ_API_KEY, content, 'llama-3.3-70b-versatile')), model: 'llama-3.3-70b-versatile' };
-        } catch(e) {
-          if (hasOR) {
-            return await callOpenRouterWithFallback(prompt, process.env.OPENROUTER_API_KEY, content, ['meta-llama/llama-3.3-70b-instruct:free', 'nvidia/nemotron-3-super-120b-a12b:free']);
-          }
-          throw e;
-        }
-      },
-    });
-  } else if (hasOR) {
-    // No Groq — use OpenRouter Llama as primary
-    analysts_config.push({
-      name: 'Llama-70B',
-      primaryModel: 'meta-llama/llama-3.3-70b-instruct:free',
-      fallbackModels: ['nvidia/nemotron-3-super-120b-a12b:free', 'meta-llama/llama-3.2-3b-instruct:free'],
-      call: async (prompt, content) => callOpenRouterWithFallback(prompt, process.env.OPENROUTER_API_KEY, content, ['meta-llama/llama-3.3-70b-instruct:free', 'nvidia/nemotron-3-super-120b-a12b:free', 'meta-llama/llama-3.2-3b-instruct:free']),
-    });
-  }
-
-  // Analyst 2: GPT-OSS 120B (OpenRouter, free) → Nemotron 120B (fallback)
-  if (hasOR) {
-    analysts_config.push({
-      name: 'GPT-OSS-120B',
-      primaryModel: 'openai/gpt-oss-120b:free',
-      fallbackModels: ['nvidia/nemotron-3-super-120b-a12b:free', 'google/gemma-4-31b-it:free'],
-      call: async (prompt, content) => callOpenRouterWithFallback(prompt, process.env.OPENROUTER_API_KEY, content, ['openai/gpt-oss-120b:free', 'nvidia/nemotron-3-super-120b-a12b:free', 'google/gemma-4-31b-it:free']),
-    });
-  }
-
-  // Analyst 3: Qwen3-80B (OpenRouter, free) → Hermes-3 405B (fallback)
-  if (hasOR) {
-    analysts_config.push({
-      name: 'Qwen3-80B',
-      primaryModel: 'qwen/qwen3-next-80b-a3b-instruct:free',
-      fallbackModels: ['qwen/qwen3-coder:free', 'nousresearch/hermes-3-llama-3.1-405b:free'],
-      call: async (prompt, content) => callOpenRouterWithFallback(prompt, process.env.OPENROUTER_API_KEY, content, ['qwen/qwen3-next-80b-a3b-instruct:free', 'qwen/qwen3-coder:free', 'nousresearch/hermes-3-llama-3.1-405b:free']),
-    });
-  }
+  // ── Analyst configs: Groq primary, OpenRouter fallback ────────
+  // Each analyst uses a DIFFERENT Groq model for genuine independence.
+  // Groq has per-user rate limits (not shared like OpenRouter free tier).
+  const analysts_config = [
+    {
+      name: 'Llama-3.3-70B',
+      groqModel: 'llama-3.3-70b-versatile',
+      orFallback: ['meta-llama/llama-3.3-70b-instruct:free', 'nvidia/nemotron-3-super-120b-a12b:free'],
+    },
+    {
+      name: 'DeepSeek-R1-70B',
+      groqModel: 'deepseek-r1-distill-llama-70b',
+      orFallback: ['openai/gpt-oss-120b:free', 'google/gemma-4-31b-it:free'],
+    },
+    {
+      name: 'Llama-3.1-8B',
+      groqModel: 'llama-3.1-8b-instant',
+      orFallback: ['meta-llama/llama-3.2-3b-instruct:free', 'qwen/qwen3-coder:free'],
+    },
+  ];
 
   const errors = [];
 
-  // ── Phase 1: Call all analysts in parallel ────────────────────
+  // ── Phase 1: Call all 3 analysts in parallel ──────────────────
   const analystPromises = analysts_config.map(async (provider) => {
     try {
-      const result = await provider.call(ANALYST_PROMPT, snapshotStr);
+      const result = await smartCall(
+        ANALYST_PROMPT, snapshotStr, groqKey, orKey,
+        provider.groqModel, provider.orFallback
+      );
       const parsed = extractJSON(result.text);
       return {
         provider: provider.name,
-        model: result.modelUsed || provider.primaryModel,
+        model: result.modelUsed,
         verdict: parsed?.verdict || 'UNKNOWN',
         confidence: parsed?.confidence || 0,
         retailView: parsed?.retailView || 'N/A',
@@ -287,7 +269,7 @@ export default async function handler(req, res) {
       errors.push({ provider: provider.name, error: e.message });
       return {
         provider: provider.name,
-        model: provider.primaryModel,
+        model: provider.groqModel,
         verdict: 'ERROR',
         confidence: 0,
         reasoning: `API call failed: ${e.message}`,
@@ -299,10 +281,10 @@ export default async function handler(req, res) {
   const analysts = await Promise.all(analystPromises);
   const validAnalysts = analysts.filter(a => !a.error);
 
-  // ── Phase 2: Master AI (Hermes-3 405B with fallback chain) ────
+  // ── Phase 2: Master AI ────────────────────────────────────────
   let master = null;
 
-  if (validAnalysts.length >= 2 && hasOR) {
+  if (validAnalysts.length >= 2) {
     try {
       const masterInput = JSON.stringify(validAnalysts.map(a => ({
         provider: a.provider,
@@ -314,16 +296,14 @@ export default async function handler(req, res) {
         reasoning: a.reasoning,
       })), null, 2);
 
-      // Master model fallback chain: Hermes-405B → GPT-OSS-120B → Nemotron-120B → Qwen3-Coder
-      const masterChain = [
-        'nousresearch/hermes-3-llama-3.1-405b:free',
-        'openai/gpt-oss-120b:free',
-        'nvidia/nemotron-3-super-120b-a12b:free',
-        'qwen/qwen3-coder:free',
-      ];
-
-      const result = await callOpenRouterWithFallback(MASTER_PROMPT, process.env.OPENROUTER_API_KEY, masterInput, masterChain);
-      const parsed = extractJSON(result.text);
+      // Master uses Groq Llama-70B (most capable Groq model)
+      // OpenRouter fallback: GPT-OSS-120B → Nemotron-120B → Qwen3-Coder
+      const masterResult = await smartCall(
+        MASTER_PROMPT, masterInput, groqKey, orKey,
+        'llama-3.3-70b-versatile',
+        ['openai/gpt-oss-120b:free', 'nvidia/nemotron-3-super-120b-a12b:free', 'qwen/qwen3-coder:free']
+      );
+      const parsed = extractJSON(masterResult.text);
       master = {
         verdict: parsed?.verdict || 'WAIT',
         confidence: parsed?.confidence || 0,
@@ -333,39 +313,10 @@ export default async function handler(req, res) {
         riskWarning: parsed?.riskWarning || 'N/A',
         optimalEntry: parsed?.optimalEntry || 'N/A',
         positionAdvice: parsed?.positionAdvice || 'N/A',
-        masterModel: result.modelUsed,
+        masterModel: masterResult.modelUsed,
       };
     } catch(e) {
       errors.push({ provider: 'Master AI', error: e.message });
-      master = computeFallbackMaster(validAnalysts);
-    }
-  } else if (validAnalysts.length >= 2 && hasGroq) {
-    // No OpenRouter — try Groq for master
-    try {
-      const masterInput = JSON.stringify(validAnalysts.map(a => ({
-        provider: a.provider,
-        verdict: a.verdict,
-        confidence: a.confidence,
-        trapDetected: a.trapDetected,
-        trapType: a.trapType,
-        reasoning: a.reasoning,
-      })), null, 2);
-
-      const masterRaw = await callWithRetry(() => callGroq(MASTER_PROMPT, process.env.GROQ_API_KEY, masterInput, 'llama-3.3-70b-versatile'));
-      const parsed = extractJSON(masterRaw);
-      master = {
-        verdict: parsed?.verdict || 'WAIT',
-        confidence: parsed?.confidence || 0,
-        consensus: parsed?.consensus || 'unknown',
-        finalReasoning: parsed?.finalReasoning || 'Master analysis unavailable',
-        keyInsight: parsed?.keyInsight || 'N/A',
-        riskWarning: parsed?.riskWarning || 'N/A',
-        optimalEntry: parsed?.optimalEntry || 'N/A',
-        positionAdvice: parsed?.positionAdvice || 'N/A',
-        masterModel: 'llama-3.3-70b (Groq)',
-      };
-    } catch(e) {
-      errors.push({ provider: 'Master (Groq)', error: e.message });
       master = computeFallbackMaster(validAnalysts);
     }
   } else if (validAnalysts.length === 1) {
@@ -373,11 +324,11 @@ export default async function handler(req, res) {
       verdict: validAnalysts[0].verdict,
       confidence: validAnalysts[0].confidence,
       consensus: 'single-analyst',
-      finalReasoning: 'Only 1 AI analyst available. Verdict from ' + validAnalysts[0].provider + '.',
+      finalReasoning: 'Only 1 AI analyst succeeded. Verdict from ' + validAnalysts[0].provider + '.',
       keyInsight: validAnalysts[0].reasoning,
-      riskWarning: 'Limited analysis — only 1 AI provider was available.',
+      riskWarning: 'Limited analysis — only 1 AI succeeded.',
       optimalEntry: validAnalysts[0].smartEntry,
-      positionAdvice: 'Reduce position size due to limited AI consensus.',
+      positionAdvice: 'Reduce position size — limited consensus.',
       masterModel: 'fallback-single',
     };
   } else {
@@ -392,9 +343,7 @@ export default async function handler(req, res) {
 function computeFallbackMaster(analysts) {
   if (!analysts || analysts.length === 0) {
     return {
-      verdict: 'WAIT',
-      confidence: 0,
-      consensus: 'no-data',
+      verdict: 'WAIT', confidence: 0, consensus: 'no-data',
       finalReasoning: 'No valid analyst results available.',
       keyInsight: 'All AI providers failed. Check API keys and try again.',
       riskWarning: 'Cannot assess risk without AI analysis.',
@@ -418,17 +367,14 @@ function computeFallbackMaster(analysts) {
   else { verdict = 'WAIT'; consensus = 'split'; }
 
   if (trapCount > 0 && verdict === 'TAKE TRADE') {
-    verdict = 'WAIT';
-    consensus = 'trap-detected';
+    verdict = 'WAIT'; consensus = 'trap-detected';
   }
 
   return {
-    verdict,
-    confidence: avgConf,
-    consensus,
+    verdict, confidence: avgConf, consensus,
     finalReasoning: `Computed consensus from ${analysts.length} analysts. ${takeCount} TAKE, ${skipCount} SKIP, ${waitCount} WAIT. ${trapCount} trap(s) detected.`,
-    keyInsight: trapCount > 0 ? 'Trap detected by at least 1 analyst — exercise caution.' : 'No traps detected by analysts.',
-    riskWarning: trapCount > 0 ? 'Potential retail trap in progress. Wait for trap to complete.' : 'Standard risk management applies.',
+    keyInsight: trapCount > 0 ? 'Trap detected — exercise caution.' : 'No traps detected.',
+    riskWarning: trapCount > 0 ? 'Potential retail trap in progress.' : 'Standard risk applies.',
     optimalEntry: 'See individual analyst recommendations.',
     positionAdvice: verdict === 'TAKE TRADE' ? 'Standard position size.' : 'Reduce or skip.',
     masterModel: 'fallback-consensus',
