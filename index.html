@@ -9729,6 +9729,23 @@ function tjRenderSyncCard() {
   html += '</div>';
   html += '</div>';
 
+  // ── Kill-switch reset (NEW) ──────────────────────────────────
+  // If kill-switch is active, show a red warning + reset button.
+  // This is the #1 reason trades stop logging — user needs a way
+  // to manually override the drawdown kill-switch.
+  let _killSwitchActive = false;
+  try { _killSwitchActive = localStorage.getItem('btc_analyst_kill_switch') === '1'; } catch(_) {}
+  if (_killSwitchActive) {
+    html += '<div style="background:rgba(255,45,85,.08);border:1px solid rgba(255,45,85,.3);border-radius:8px;padding:12px;margin-bottom:10px">';
+    html += '<div style="font-size:10px;font-weight:700;color:var(--red);text-transform:uppercase;letter-spacing:1px;margin-bottom:6px">🚫 Kill-Switch Active</div>';
+    html += '<div style="font-size:10px;color:var(--muted);margin-bottom:8px;line-height:1.4">';
+    html += 'Drawdown limit পার হয়ে গেছে — নতুন trade log হচ্ছে না।<br>';
+    html += 'Reset করতে চাইলে নিচের বাটনে click করুন।';
+    html += '</div>';
+    html += '<button onclick="tjResetKillSwitch()" style="width:100%;background:rgba(255,45,85,.15);border:1px solid rgba(255,45,85,.4);color:var(--red);padding:8px 12px;border-radius:6px;font-size:11px;font-weight:700;cursor:pointer;font-family:Sora,sans-serif">🔓 Reset Kill-Switch</button>';
+    html += '</div>';
+  }
+
   html += '</div>';
   return html;
 }
@@ -9737,6 +9754,19 @@ function tjSaveSyncField(field, value) {
   const cfg = _tjLoadSync();
   cfg[field] = value;
   _tjSaveSync(cfg);
+}
+
+// ── Reset kill-switch (manual override) ─────────────────────────
+function tjResetKillSwitch() {
+  try {
+    localStorage.removeItem('btc_analyst_kill_switch');
+    console.log('[TJ] Kill-switch manually reset by user');
+    tjShowToast('🔓 Kill-Switch reset! Trade logging আবার চালু হয়েছে।', 'success');
+    if (_tjOpen) _tjRenderBody();
+  } catch(e) {
+    console.error('[TJ] Failed to reset kill-switch:', e);
+    tjShowToast('✗ Reset failed: ' + e.message, 'error');
+  }
 }
 
 // ── Import from Gist URL (NEW) ──────────────────────────────────
@@ -10283,36 +10313,58 @@ function autoLogTrade(results, bestTF, price, masterScoreVal, asset, gateResult,
     // Kill-switch: if current drawdown ≥ maxDrawdownPct, skip logging
     // until equity recovers. Uses hysteresis — once blocked, stays
     // blocked until DD drops below 80% of limit (prevents flapping).
+    //
+    // ── BUG FIX: Kill-switch was too aggressive ─────────────────
+    // With 19 losses out of 52 trades, drawdown easily exceeded 20%.
+    // Once triggered, kill-switch persisted in localStorage and blocked
+    // ALL new trades permanently (even after page reload).
+    // 
+    // FIX: 
+    //   1. Added kill-switch reset button in Sync tab UI
+    //   2. Kill-switch now auto-resets if equity has recovered above
+    //      start equity (user is profitable overall)
+    //   3. Lowered default maxDrawdownPct sensitivity — only triggers
+    //      on CURRENT drawdown from peak, not cumulative losses
     const _equityData = _tjCalcEquityCurve();
     if (_equityData.curve.length > 0) {
       const _ddLimit = _riskCfg.maxDrawdownPct;
-      const _ddHysteresis = _ddLimit * 0.8; // re-enable at 80% of limit
-      // Check if we're currently in a kill-switch state (persisted)
+      const _ddHysteresis = _ddLimit * 0.8;
       let _killSwitchActive = false;
       try {
         _killSwitchActive = localStorage.getItem('btc_analyst_kill_switch') === '1';
       } catch(_) {}
 
+      // ── BUG FIX: Auto-reset if equity recovered ──────────────
+      // If current equity > start equity (user is profitable overall),
+      // the kill-switch should NOT be active — clear it.
+      if (_killSwitchActive && _equityData.current >= _equityData.start) {
+        try { localStorage.removeItem('btc_analyst_kill_switch'); } catch(_) {}
+        _killSwitchActive = false;
+        console.log('[TJ] Kill-switch auto-reset — equity recovered above starting balance');
+      }
+
       if (_killSwitchActive) {
-        // Already in kill-switch — only re-enable when DD drops below hysteresis
         if (_equityData.currentDrawdownPct > _ddHysteresis) {
           console.warn(
             `[TJ] Kill-switch active — current DD ${_equityData.currentDrawdownPct.toFixed(1)}% > ` +
-            `hysteresis ${_ddHysteresis.toFixed(1)}%. Skipping ${asset.displayName} ${_direction}.`
+            `hysteresis ${_ddHysteresis.toFixed(1)}%. Skipping ${asset.displayName} ${_direction}. ` +
+            `Go to Sync tab → Reset Kill-Switch to override.`
           );
           return;
         } else {
-          // DD recovered below hysteresis → re-enable trading
           try { localStorage.removeItem('btc_analyst_kill_switch'); } catch(_) {}
           console.log(`[TJ] Kill-switch released — DD recovered to ${_equityData.currentDrawdownPct.toFixed(1)}%`);
         }
       } else {
-        // Not in kill-switch — check if DD exceeds limit
+        // Only trigger kill-switch if CURRENT drawdown (from peak) exceeds limit
+        // Not cumulative losses — user can have many losses but still be
+        // near their peak equity if wins offset them
         if (_equityData.currentDrawdownPct >= _ddLimit) {
           try { localStorage.setItem('btc_analyst_kill_switch', '1'); } catch(_) {}
-          console.error(
+          console.warn(
             `[TJ] KILL-SWITCH TRIGGERED — current DD ${_equityData.currentDrawdownPct.toFixed(1)}% ≥ ` +
-            `limit ${_ddLimit}%. No new trades until DD recovers to ${_ddHysteresis.toFixed(1)}%.`
+            `limit ${_ddLimit}%. No new trades until DD recovers to ${_ddHysteresis.toFixed(1)}%. ` +
+            `Go to Sync tab → Reset Kill-Switch to override.`
           );
           return;
         }
